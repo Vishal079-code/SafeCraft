@@ -1,6 +1,4 @@
 """
-Day 4 — Call Graph Construction (v2: relative + submodule import resolution)
-
 Reads repo_map.json (from Day 3) and builds a directed dependency graph:
 an edge A -> B means "file A imports something from file B".
 
