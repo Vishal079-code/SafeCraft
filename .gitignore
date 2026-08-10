@@ -1,0 +1,26 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache & build files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local Database & Large Data Maps
+repo_map.json
+chroma_db/
+
+# Environment files & secret keys
+.env
+*.env
+
+# Logs
+*.log
+
+# IDE & OS specific files (Recommended additions)
+.vscode/
+.idea/
+.DS_Store

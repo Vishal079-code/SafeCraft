@@ -1,0 +1,15 @@
+# Phase 1-2: parsing, graph, retrieval
+networkx==3.3
+chromadb==1.5.9
+sentence-transformers==3.0.1
+rank-bm25==0.2.2
+
+# Phase 4: LLM API
+anthropic==0.34.2
+python-dotenv==1.0.1
+
+# Phase 6: verification
+pytest==8.3.2
+
+# General
+tiktoken==0.7.0
