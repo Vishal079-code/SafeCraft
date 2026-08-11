@@ -27,8 +27,22 @@ class HybridRetriever:
 
         # Fetch extra candidates (top_k * 2) from both indexers to maximize fusion recall
         candidate_k = max(top_k * 2, top_k)
-        vector_results = self.vector_store.query(query, top_k=candidate_k)
-        bm25_results = self.bm25_index.query(query, top_k=candidate_k)
+        
+        # Safely invoke .query or .search on vector store
+        if hasattr(self.vector_store, "query"):
+            vector_results = self.vector_store.query(query, top_k=candidate_k)
+        elif hasattr(self.vector_store, "search"):
+            vector_results = self.vector_store.search(query, top_k=candidate_k)
+        else:
+            vector_results = []
+
+        # Safely invoke .query or .search on BM25 store
+        if hasattr(self.bm25_index, "query"):
+            bm25_results = self.bm25_index.query(query, top_k=candidate_k)
+        elif hasattr(self.bm25_index, "search"):
+            bm25_results = self.bm25_index.search(query, top_k=candidate_k)
+        else:
+            bm25_results = []
 
         rrf_scores: Dict[str, float] = {}
         unit_map: Dict[str, Dict[str, Any]] = {}
@@ -62,6 +76,13 @@ class HybridRetriever:
 
         return final_results
 
+    # Interface aliases for multi-retriever benchmark support
+    def query(self, prompt: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        return self.retrieve(prompt, top_k=top_k)
+
+    def search(self, prompt: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        return self.retrieve(prompt, top_k=top_k)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -69,7 +90,6 @@ if __name__ == "__main__":
         with open("sample_repo/repo_map.json") as f:
             repo_map = json.load(f)
 
-        # Initialize and populate both indices
         v_store = VectorStore()
         v_store.index_repo_map(repo_map)
 
