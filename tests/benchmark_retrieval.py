@@ -46,7 +46,7 @@ class RetrievalBenchmark:
         self.k = max(1, k)
 
         self.vector_store = VectorStore()
-        
+
         repo_map_path = os.path.join(self.repo_dir, "repo_map.json")
         if os.path.exists(repo_map_path):
             self.repo_map = load_repo_map(repo_map_path)
@@ -74,6 +74,11 @@ class RetrievalBenchmark:
         return []
 
     def _normalize_path(self, path: str) -> str:
+        """
+        Normalizes a path to the 'sample_repo/...' prefixed format used by
+        BENCHMARK_TASKS' expected_files, so retrieved paths (which come back
+        unprefixed, e.g. 'auth/login.py') can be compared against ground truth.
+        """
         if not path or not isinstance(path, str):
             return ""
         path = path.replace("\\", "/").strip("/")
@@ -83,6 +88,35 @@ class RetrievalBenchmark:
         elif not path.startswith("sample_repo/"):
             path = f"sample_repo/{path}"
         return path
+
+    def _extract_raw_filepath(self, hit: Any) -> str:
+        """
+        Returns the RAW (unprefixed) filepath as stored in the dependency
+        graph - e.g. 'auth/login.py', NOT 'sample_repo/auth/login.py'.
+
+        This is used specifically for graph lookups. self.graph's nodes are
+        the unprefixed relative_path keys that RepoIndexer originally
+        produced (Day 3/4), so expand_with_dependencies() must be called
+        with paths in that same unprefixed format or every lookup silently
+        fails to match any node.
+
+        This is intentionally kept separate from _extract_file_path() below,
+        which normalizes (prefixes) paths for METRIC comparison against
+        expected_files. The two must not be conflated - the graph and the
+        ground-truth list use different path conventions.
+        """
+        if isinstance(hit, dict):
+            meta = hit.get("metadata")
+            if isinstance(meta, dict):
+                fp = meta.get("filepath") or meta.get("file_path")
+                if fp:
+                    return fp
+            unit_id = str(hit.get("id", ""))
+            if "::" in unit_id:
+                return unit_id.split("::")[0]
+        elif isinstance(hit, str):
+            return hit
+        return ""
 
     def _extract_file_path(self, hit: Any) -> str:
         if isinstance(hit, str):
@@ -148,8 +182,16 @@ class RetrievalBenchmark:
             hybrid_hits = self._query_store(self.hybrid_retriever, query, top_k=self.k)
             hybrid_files = [self._extract_file_path(h) for h in hybrid_hits]
 
-            # Priority-aware graph expansion
-            expanded_deps = expand_with_dependencies(self.graph, hybrid_files, hops=1)
+            # FIX: graph expansion must use RAW (unprefixed) paths, since
+            # self.graph's nodes are unprefixed (e.g. "auth/login.py"), not
+            # the "sample_repo/..." prefixed format used for metric comparison.
+            # Previously this passed the already-normalized `hybrid_files`,
+            # which never matched any graph node - expansion silently did
+            # nothing, making this column identical to "Hybrid RRF".
+            raw_hybrid_paths = [self._extract_raw_filepath(h) for h in hybrid_hits]
+            raw_hybrid_paths = [p for p in raw_hybrid_paths if p]
+
+            expanded_deps = expand_with_dependencies(self.graph, raw_hybrid_paths, hops=1)
             raw_expanded_files = [self._normalize_path(f) for f in expanded_deps]
 
             combined_files = []
