@@ -5,6 +5,7 @@ sentence-transformers==3.0.1
 rank-bm25==0.2.2
 
 # Phase 4: LLM API
+google-genai
 anthropic==0.34.2
 python-dotenv==1.0.1
 
