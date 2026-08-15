@@ -1,8 +1,7 @@
 """
-Agent Context Bundler: Resolves local Python imports and bundles multi-file 
+Agent Context Bundler: Resolves local Python imports and bundles multi-file
 workspace context.
 """
-
 import ast
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -10,8 +9,13 @@ from typing import Dict, List, Optional
 
 def extract_local_imports(code_content: str, current_filepath: str = "") -> List[str]:
     """
-    Parses Python code AST to extract imported module strings.
-    Handles relative imports (e.g. from .models import User) by resolving relative paths.
+    Parses Python code AST to extract imported module strings, resolved to
+    full dotted paths (relative imports are expanded using current_filepath).
+
+    Also expands 'from package import submodule' style imports into
+    'package.submodule' - without this, `from auth import models` only
+    ever yields "auth" (the module), silently dropping which submodule
+    was actually imported, which made it unresolvable to auth/models.py.
     """
     imported_modules = []
     try:
@@ -28,42 +32,49 @@ def extract_local_imports(code_content: str, current_filepath: str = "") -> List
         elif isinstance(node, ast.ImportFrom):
             level = node.level or 0
             if level == 0:
-                if node.module:
-                    imported_modules.append(node.module)
+                base_module = node.module
             else:
-                # Relative import handling (e.g. level=1 is current directory)
                 base_parts = current_dir_parts[: max(0, len(current_dir_parts) - (level - 1))]
                 prefix = ".".join(base_parts)
                 if node.module:
-                    full_module = f"{prefix}.{node.module}" if prefix else node.module
+                    base_module = f"{prefix}.{node.module}" if prefix else node.module
                 else:
-                    full_module = prefix
-                if full_module:
-                    imported_modules.append(full_module)
+                    base_module = prefix
+
+            if not base_module:
+                continue
+
+            # FIX: also add "<base_module>.<imported_name>" candidates -
+            # covers 'from auth import models' (base_module="auth",
+            # imported name="models") -> "auth.models", which
+            # resolve_import_to_filepath can then correctly map to
+            # auth/models.py. The plain base_module is still added too,
+            # since some imported names are attributes/classes (not
+            # files) and only the package's __init__.py should resolve
+            # for those - resolve_import_to_filepath already tries both
+            # forms and only keeps whichever actually exists on disk.
+            imported_modules.append(base_module)
+            for alias in node.names:
+                if alias.name != "*":
+                    imported_modules.append(f"{base_module}.{alias.name}")
 
     return imported_modules
 
 
 def resolve_import_to_filepath(module_name: str, workspace_files: Dict[str, str]) -> Optional[str]:
     """
-    Attempts to map an imported module (e.g., 'auth.models') to a workspace filepath 
+    Attempts to map an imported module (e.g., 'auth.models') to a workspace filepath
     (e.g., 'auth/models.py' or 'auth/models/__init__.py').
     """
     if not module_name:
         return None
 
     path_prefix = module_name.replace(".", "/")
-    possible_paths = [
-        f"{path_prefix}.py",
-        f"{path_prefix}/__init__.py",
-    ]
-
-    # Exact match check
+    possible_paths = [f"{path_prefix}.py", f"{path_prefix}/__init__.py"]
     for path in possible_paths:
         if path in workspace_files:
             return path
 
-    # Submodule fallback check (e.g., 'auth.models.User')
     parts = module_name.split(".")
     while len(parts) > 1:
         parts.pop()
@@ -90,8 +101,6 @@ class ContextBundler:
 
         bundled = {target_filepath: self.workspace_files[target_filepath]}
         target_code = self.workspace_files[target_filepath]
-
-        # Extract dependencies considering current file location
         imports = extract_local_imports(target_code, current_filepath=target_filepath)
 
         for module in imports:
