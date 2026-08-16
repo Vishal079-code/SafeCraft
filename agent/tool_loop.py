@@ -200,3 +200,95 @@ def get_gemini_tool_caller(api_key: Optional[str] = None, model: str = "gemini-3
         )
 
     return caller
+def run_and_commit(
+    loop: "AgentToolLoop",
+    user_request: str,
+    target_filepath: str,
+    llm_tool_caller_fn,
+    commit_to_disk: bool = False,
+    disk_root: Optional[str] = None,
+):
+    """
+    Runs the full tool-calling loop, then feeds its resulting patches
+    through the SAME staging/verification/disk-commit pipeline used by
+    AgentOrchestrator - so the agentic (multi-turn, tool-using) path and
+    the simple (single-turn) path both end up going through identical
+    safety checks (exact-match validation, AST syntax check, path
+    containment) before anything touches disk.
+
+    Returns a dict shaped consistently with AgentOrchestrator's AgentResult
+    fields, so callers don't need to branch on which path was used.
+    """
+    from agent.patch_applier import apply_patches_staged, PatchApplyError
+    from agent.disk_committer import commit_staged_workspace_to_disk, DiskCommitError
+
+    loop_result = loop.run(user_request, target_filepath, llm_tool_caller_fn)
+
+    if not loop_result["success"]:
+        return {
+            "success": False,
+            "staged_workspace": loop.workspace_files,
+            "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"],
+            "error_message": loop_result["error_message"],
+            "committed_to_disk": False,
+            "files_written": 0,
+        }
+
+    try:
+        staged_workspace = apply_patches_staged(loop.workspace_files, loop_result["patches"])
+    except PatchApplyError as e:
+        return {
+            "success": False,
+            "staged_workspace": loop.workspace_files,
+            "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"],
+            "error_message": f"Patch Staging Failed: {e}",
+            "committed_to_disk": False,
+            "files_written": 0,
+        }
+
+    if not commit_to_disk:
+        return {
+            "success": True,
+            "staged_workspace": staged_workspace,
+            "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"],
+            "error_message": None,
+            "committed_to_disk": False,
+            "files_written": 0,
+        }
+
+    if not disk_root:
+        return {
+            "success": False,
+            "staged_workspace": staged_workspace,
+            "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"],
+            "error_message": "commit_to_disk=True but no disk_root was provided.",
+            "committed_to_disk": False,
+            "files_written": 0,
+        }
+
+    try:
+        commit_success, files_written = commit_staged_workspace_to_disk(staged_workspace, disk_root)
+    except DiskCommitError as e:
+        return {
+            "success": False,
+            "staged_workspace": staged_workspace,
+            "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"],
+            "error_message": f"Disk Commit Blocked: {e}",
+            "committed_to_disk": False,
+            "files_written": 0,
+        }
+
+    return {
+        "success": True,
+        "staged_workspace": staged_workspace,
+        "patches": loop_result["patches"],
+        "rounds_used": loop_result["rounds_used"],
+        "error_message": None,
+        "committed_to_disk": commit_success,
+        "files_written": files_written,
+    }
