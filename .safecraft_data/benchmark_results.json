@@ -1,0 +1,35 @@
+[
+  {
+    "task_id": "T001",
+    "raw_passed": true,
+    "anon_passed": true,
+    "raw_input_tokens": 323,
+    "anon_input_tokens": 321,
+    "token_savings_pct": 0.62,
+    "deanon_integrity": true,
+    "raw_error": "",
+    "anon_error": ""
+  },
+  {
+    "task_id": "T002",
+    "raw_passed": true,
+    "anon_passed": true,
+    "raw_input_tokens": 334,
+    "anon_input_tokens": 374,
+    "token_savings_pct": -11.98,
+    "deanon_integrity": true,
+    "raw_error": "",
+    "anon_error": ""
+  },
+  {
+    "task_id": "T003",
+    "raw_passed": true,
+    "anon_passed": true,
+    "raw_input_tokens": 384,
+    "anon_input_tokens": 381,
+    "token_savings_pct": 0.78,
+    "deanon_integrity": true,
+    "raw_error": "",
+    "anon_error": ""
+  }
+]

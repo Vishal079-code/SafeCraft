@@ -15,7 +15,7 @@ class LLMClientError(Exception):
 def get_gemini_client(
     prompt: str,
     api_key: Optional[str] = None,
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-3.6-flash",
     temperature: float = 0.0,
 ) -> str:
     """

@@ -15,11 +15,15 @@ def validate_staged_workspace(
     staged_workspace: Dict[str, str],
     modified_files: List[str],
     test_dir: str = "tests/",
+    syntax_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Validates staged workspace files in two phases:
     1. AST syntax check on all modified files.
-    2. Pytest execution against the test suite.
+    2. Pytest execution against the test suite (skipped entirely if
+       syntax_only=True - useful for benchmarks/tasks with no matching
+       test file, where running the full suite would be slow and largely
+       irrelevant to what's being measured).
     """
     # Phase 1: AST Syntax Validation
     for filepath in modified_files:
@@ -50,7 +54,10 @@ def validate_staged_workspace(
                             f"Please generate a corrected patch fixing this syntax error.",
             }
 
-    # Phase 2: Pytest Execution
+    # Phase 2: Pytest Execution (skipped if syntax_only=True)
+    if syntax_only:
+        return {"valid": True, "error_type": None, "feedback": None}
+
     test_results = run_pytest_suite(test_dir=test_dir)
     if not test_results["success"]:
         logger.warning(f"Pytest suite failed with return code {test_results['returncode']}")
