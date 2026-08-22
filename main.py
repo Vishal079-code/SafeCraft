@@ -1,45 +1,50 @@
 """
-Main CLI Entrypoint: Interactive Developer Agent with Privacy-Preserving LLM Integration
+Main CLI Entrypoint: Interactive Developer Agent with Privacy-Preserving LLM Integration.
+Uses the real, retry-enabled AgentOrchestrator and (by default) the real
+Gemini API - falls back to a demo mock only if no GEMINI_API_KEY is set,
+so the CLI is still runnable/testable without a live key.
 """
-
+import os
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from agent.orchestrator import AgentOrchestrator
+from agent.llm_client import build_llm_caller
 
 
 def read_file_safely(filepath: str) -> Optional[str]:
     try:
         return Path(filepath).read_text(encoding="utf-8")
     except Exception as e:
-        print(f"❌ Error reading file '{filepath}': {e}")
+        print(f"Error reading file '{filepath}': {e}")
         return None
 
 
-def mock_llm_provider(prompt: str) -> str:
+def demo_fallback_mock(prompt: str) -> str:
     """
-    ⚠️ DEMO PLACEHOLDER ONLY:
-    This mock returns hardcoded SEARCH/REPLACE blocks formatted for specific test identifiers
-    and target file names. Replace this function with a live LLM API handler (e.g. Anthropic,
-    OpenAI, or Gemini API) before running against arbitrary user files.
+    Used ONLY when no GEMINI_API_KEY is configured, so the CLI stays
+    runnable for a quick demo/test without a live key. This is NOT
+    representative of real model behavior beyond the exact toy scenario
+    it was written for - real usage should always go through the actual
+    API via build_llm_caller.
     """
-    return """
-File: target.py
-<<<<<<< SEARCH
-def calculate_salary(employee_grade, __ANON_VAR_1__):
-    __ANON_VAR_2__ = __ANON_CONST_1__ * __ANON_VAR_1__
-    return __ANON_VAR_1__ + __ANON_VAR_2__
-=======
-def calculate_salary(employee_grade, __ANON_VAR_1__):
-    __ANON_VAR_2__ = __ANON_CONST_1__ * __ANON_VAR_1__
-    return (__ANON_VAR_1__ + __ANON_VAR_2__) * 0.95
->>>>>>> REPLACE
-"""
+    return (
+        "File: target.py\n<<<<<<< SEARCH\n"
+        "def __ANON_FUNC_1__(employee_grade, __ANON_VAR_1__):\n"
+        "    __ANON_VAR_2__ = __ANON_CONST_1__ * __ANON_VAR_1__\n"
+        "    return __ANON_VAR_1__ + __ANON_VAR_2__\n=======\n"
+        "def __ANON_FUNC_1__(employee_grade, __ANON_VAR_1__):\n"
+        "    __ANON_VAR_2__ = __ANON_CONST_1__ * __ANON_VAR_1__\n"
+        "    return (__ANON_VAR_1__ + __ANON_VAR_2__) * 0.95\n>>>>>>> REPLACE"
+    )
 
 
 def run_cli():
     print("=" * 60)
-    print("  🔒 PRIVACY-PRESERVING AI CODE AGENT")
+    print("  PRIVACY-PRESERVING AI CODE AGENT")
     print("=" * 60)
 
     target_file = input("Enter target python file path (e.g., auth/payroll.py): ").strip()
@@ -56,7 +61,6 @@ def run_cli():
         print("No instruction provided. Exiting.")
         return
 
-    # Configuration for protected terms
     protected_ids_input = input("Protected identifiers (comma-separated, optional): ").strip()
     protected_ids = [i.strip() for i in protected_ids_input.split(",") if i.strip()]
 
@@ -70,41 +74,47 @@ def run_cli():
             except ValueError:
                 protected_lits.append(l_str)
 
-    orchestrator = AgentOrchestrator(
-        protected_identifiers=protected_ids,
-        protected_literals=protected_lits,
-    )
-
+    orchestrator = AgentOrchestrator(protected_identifiers=protected_ids, protected_literals=protected_lits)
     workspace = {target_file: content}
 
-    print("\n⏳ Processing request through local privacy pipeline...")
+    has_key = bool(os.getenv("GEMINI_API_KEY"))
+    if has_key:
+        print("\nUsing live Gemini API...")
+        llm_caller = build_llm_caller(provider="gemini")
+    else:
+        print("\nNo GEMINI_API_KEY found - using demo fallback mock (not real model output).")
+        llm_caller = demo_fallback_mock
+
+    print("\nProcessing request through local privacy pipeline (up to 2 attempts on patch mismatch)...")
     result = orchestrator.run_cycle(
         user_request=user_request,
         target_filepath=target_file,
         workspace_files=workspace,
-        llm_caller_fn=mock_llm_provider,
+        llm_caller_fn=llm_caller,
     )
 
     if not result.success:
-        print(f"\n❌ Task Failed: {result.error_message}")
+        print(f"\nTask Failed: {result.error_message}")
         return
 
+    print(f"\nSucceeded on attempt {result.attempts_used} of up to 2.")
+
     print("\n" + "=" * 60)
-    print("  🔍 SANITIZED PROMPT (SENT TO REMOTE LLM)")
+    print("  SANITIZED PROMPT (SENT TO REMOTE LLM)")
     print("=" * 60)
     print(result.anonymized_prompt)
 
     print("\n" + "=" * 60)
-    print("  ✨ STAGED CHANGES (RESTORED LOCALLY)")
+    print("  STAGED CHANGES (RESTORED LOCALLY)")
     print("=" * 60)
     print(result.staged_workspace[target_file])
 
-    confirm = input("\n💾 Write changes to disk? (y/N): ").strip().lower()
+    confirm = input("\nWrite changes to disk? (y/N): ").strip().lower()
     if confirm == "y":
         Path(target_file).write_text(result.staged_workspace[target_file], encoding="utf-8")
-        print(f"✅ Successfully written changes to '{target_file}'!")
+        print(f"Successfully written changes to '{target_file}'!")
     else:
-        print("🚫 Changes discarded.")
+        print("Changes discarded.")
 
 
 if __name__ == "__main__":

@@ -3,17 +3,26 @@ Agent Orchestrator: End-to-end pipeline connecting Privacy Anonymization,
 LLM Prompting, Diff Parsing, De-anonymization, In-Memory Patch Staging,
 and (optionally) Atomic Disk Commit.
 
-Includes a retry loop for patch-staging failures - motivated by real,
-observed evidence that LLM output is not perfectly deterministic even at
-temperature=0: the exact same task/prompt can produce a SEARCH block that
-matches on one call and doesn't on another. Retrying with a fresh LLM
-call is a cheap, evidence-backed mitigation for this specific failure mode.
+IMPORTANT DESIGN FIX: patches are applied against the ANONYMIZED code
+representation, not the original raw file, and de-anonymization happens
+ONCE on the final staged result - not per patch fragment before matching.
+
+Root cause this fixes: anonymize_code() uses ast.unparse() internally,
+which reformats code (e.g. collapses a multi-line dict literal onto one
+line) as a side effect of renaming identifiers. The LLM only ever sees
+this reformatted (anonymized) version and naturally reproduces THAT
+structure in its SEARCH block. Matching that SEARCH block against the
+ORIGINAL, differently-formatted file was a structural mismatch - not
+fixable by quote/whitespace normalization, since the actual line
+structure differs. Matching against the anonymized text (same
+representation the model actually saw) fixes this at the root.
 """
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
 from privacy.anonymizer import anonymize_code
-from agent.diff_parser import process_llm_diff_response, CodePatch
+from privacy.deanonymizer import deanonymize_code
+from agent.diff_parser import parse_search_replace_blocks, CodePatch
 from agent.patch_applier import apply_patches_staged, PatchApplyError
 from agent.disk_committer import commit_staged_workspace_to_disk, DiskCommitError
 
@@ -59,16 +68,6 @@ class AgentOrchestrator:
         disk_root: Optional[str] = None,
         max_attempts: int = 2,
     ) -> AgentResult:
-        """
-        Runs a complete end-to-end cycle, retrying the LLM call + patch
-        staging step up to max_attempts times if staging fails.
-
-        Anonymization happens ONCE (identifiers/literals don't change
-        between retries - only the LLM's response might). Each retry
-        makes a fresh LLM call with the SAME anonymized prompt, since
-        we've observed that a repeat call can succeed where a prior one
-        didn't, even with no change to the input.
-        """
         if target_filepath not in workspace_files:
             return AgentResult(success=False, staged_workspace=workspace_files, patches=[], anonymized_prompt="", error_message=f"Target file '{target_filepath}' not found in workspace.")
 
@@ -93,41 +92,67 @@ class AgentOrchestrator:
                 llm_response = llm_caller_fn(full_llm_prompt)
             except Exception as e:
                 last_error = f"LLM Invocation Error: {str(e)}"
-                continue  # retry - a transient API error may not recur
+                continue
+
+            raw_blocks = parse_search_replace_blocks(llm_response, default_filepath=target_filepath)
+            if not raw_blocks:
+                last_error = "Malformed patch: No valid SEARCH/REPLACE blocks found in LLM response."
+                continue
+
+            # Build patches WITHOUT de-anonymizing yet - these still contain
+            # placeholders, matching the anonymized_code representation the
+            # LLM actually generated its SEARCH block against.
+            still_anonymized_patches = []
+            malformed = False
+            for filepath, search_block, replace_block in raw_blocks:
+                target_path = filepath or target_filepath
+                if not search_block.strip():
+                    last_error = f"Invalid patch for '{target_path}': SEARCH block cannot be empty."
+                    malformed = True
+                    break
+                still_anonymized_patches.append(CodePatch(filepath=target_path, search_text=search_block, replace_text=replace_block))
+            if malformed:
+                continue
 
             try:
-                patches = process_llm_diff_response(llm_response=llm_response, privacy_maps=privacy_maps, default_filepath=target_filepath)
-            except Exception as e:
-                last_error = f"Diff Parsing Failed: {str(e)}"
-                continue  # retry - the model may format correctly next time
-
-            last_patches = patches
-
-            try:
-                staged_workspace = apply_patches_staged(workspace_files, patches)
+                # Apply against the ANONYMIZED text (same structure the
+                # model saw), not the original file - this is the actual fix.
+                anonymized_workspace = {target_filepath: anonymized_code}
+                staged_anonymized = apply_patches_staged(anonymized_workspace, still_anonymized_patches)
             except PatchApplyError as e:
-                # This is the exact failure mode observed in practice:
-                # SEARCH block didn't match due to LLM non-determinism.
-                # A fresh call with the SAME prompt has a real chance of
-                # succeeding, since nothing about the input changed.
                 last_error = f"Patch Staging Failed: {str(e)}"
                 continue
 
-            # Staging succeeded.
+            # De-anonymize ONCE, on the whole final staged result - not per
+            # patch fragment before matching.
+            final_code = deanonymize_code(staged_anonymized[target_filepath], privacy_maps)
+            staged_workspace = dict(workspace_files)
+            staged_workspace[target_filepath] = final_code
+
+            # Patches returned to the caller ARE de-anonymized, for
+            # readability/inspection purposes (callers expect real names).
+            last_patches = [
+                CodePatch(
+                    filepath=p.filepath,
+                    search_text=deanonymize_code(p.search_text, privacy_maps),
+                    replace_text=deanonymize_code(p.replace_text, privacy_maps),
+                )
+                for p in still_anonymized_patches
+            ]
+
             if not commit_to_disk:
-                return AgentResult(success=True, staged_workspace=staged_workspace, patches=patches, anonymized_prompt=full_llm_prompt, error_message=None, attempts_used=attempt)
+                return AgentResult(success=True, staged_workspace=staged_workspace, patches=last_patches, anonymized_prompt=full_llm_prompt, error_message=None, attempts_used=attempt)
 
             if not disk_root:
-                return AgentResult(success=False, staged_workspace=staged_workspace, patches=patches, anonymized_prompt=full_llm_prompt, error_message="commit_to_disk=True but no disk_root was provided.", attempts_used=attempt)
+                return AgentResult(success=False, staged_workspace=staged_workspace, patches=last_patches, anonymized_prompt=full_llm_prompt, error_message="commit_to_disk=True but no disk_root was provided.", attempts_used=attempt)
 
             try:
                 commit_success, files_written = commit_staged_workspace_to_disk(staged_workspace, disk_root)
             except DiskCommitError as e:
-                return AgentResult(success=False, staged_workspace=staged_workspace, patches=patches, anonymized_prompt=full_llm_prompt, error_message=f"Disk Commit Blocked: {str(e)}", committed_to_disk=False, files_written=0, attempts_used=attempt)
+                return AgentResult(success=False, staged_workspace=staged_workspace, patches=last_patches, anonymized_prompt=full_llm_prompt, error_message=f"Disk Commit Blocked: {str(e)}", committed_to_disk=False, files_written=0, attempts_used=attempt)
 
-            return AgentResult(success=True, staged_workspace=staged_workspace, patches=patches, anonymized_prompt=full_llm_prompt, error_message=None, committed_to_disk=commit_success, files_written=files_written, attempts_used=attempt)
+            return AgentResult(success=True, staged_workspace=staged_workspace, patches=last_patches, anonymized_prompt=full_llm_prompt, error_message=None, committed_to_disk=commit_success, files_written=files_written, attempts_used=attempt)
 
-        # All attempts exhausted.
         return AgentResult(
             success=False, staged_workspace=workspace_files, patches=last_patches, anonymized_prompt=full_llm_prompt,
             error_message=f"Failed after {max_attempts} attempt(s). Last error: {last_error}", attempts_used=max_attempts,
