@@ -14,18 +14,23 @@ def test_execute_plan_success_across_two_files():
         return '[{"description": "Add settings route", "target_filepath": "routes/api.py"}, {"description": "Add settings nav link", "target_filepath": "main.py"}]'
 
     def orchestrator_mock(prompt):
-        if "routes/api.py" in prompt:
-            return 'File: routes/api.py\n<<<<<<< SEARCH\n    return ["/home"]\n=======\n    return ["/home", "/settings"]\n>>>>>>> REPLACE'
-        return 'File: main.py\n<<<<<<< SEARCH\n    return ["Home"]\n=======\n    return ["Home", "Settings"]\n>>>>>>> REPLACE'
+        # FIX: route based on the reliable "Primary Target File:" line,
+        # not a naive "filename in prompt" check - the multi-file
+        # orchestrator now includes EVERY workspace file's content in
+        # every prompt, so a naive substring check matches on every call
+        # regardless of which subtask is actually running.
+        if "Primary Target File: routes/api.py" in prompt:
+            return 'File: routes/api.py\n<<<<<<< SEARCH\n    return [\'/home\']\n=======\n    return [\'/home\', \'/settings\']\n>>>>>>> REPLACE'
+        return 'File: main.py\n<<<<<<< SEARCH\n    return [\'Home\']\n=======\n    return [\'Home\', \'Settings\']\n>>>>>>> REPLACE'
 
     plan = generate_plan("Add settings route and nav link", list(workspace.keys()), planner_mock)
     orchestrator = AgentOrchestrator()
     result = execute_plan(plan, workspace, orchestrator, orchestrator_mock)
 
-    assert result["success"] is True
+    assert result["success"] is True, result.get("error_message")
     assert result["completed_subtasks"] == 2
-    assert '"/settings"' in result["final_workspace"]["routes/api.py"]
-    assert '"Settings"' in result["final_workspace"]["main.py"]
+    assert "/settings" in result["final_workspace"]["routes/api.py"]
+    assert "Settings" in result["final_workspace"]["main.py"]
     print("[PASS] Two-file sequential plan executed correctly, both files updated")
 
 
@@ -39,9 +44,9 @@ def test_execute_plan_stops_at_first_failure_without_corrupting_later_files():
         return '[{"description": "Add route", "target_filepath": "routes/api.py"}, {"description": "Add nav link", "target_filepath": "main.py"}]'
 
     def failing_mock(prompt):
-        if "routes/api.py" in prompt:
+        if "Primary Target File: routes/api.py" in prompt:
             # subtask 1 succeeds
-            return 'File: routes/api.py\n<<<<<<< SEARCH\n    return ["/home"]\n=======\n    return ["/home", "/settings"]\n>>>>>>> REPLACE'
+            return 'File: routes/api.py\n<<<<<<< SEARCH\n    return [\'/home\']\n=======\n    return [\'/home\', \'/settings\']\n>>>>>>> REPLACE'
         # subtask 2's SEARCH deliberately does not match -> fails
         return 'File: main.py\n<<<<<<< SEARCH\n    return ["TEXT THAT DOES NOT EXIST"]\n=======\n    return ["Home", "Settings"]\n>>>>>>> REPLACE'
 
@@ -52,9 +57,15 @@ def test_execute_plan_stops_at_first_failure_without_corrupting_later_files():
     assert result["success"] is False
     assert result["completed_subtasks"] == 1
     # subtask 1's change survives in final_workspace even though overall failed
-    assert '"/settings"' in result["final_workspace"]["routes/api.py"]
-    # subtask 2 never touched main.py
-    assert result["final_workspace"]["main.py"] == workspace["main.py"]
+    assert "/settings" in result["final_workspace"]["routes/api.py"]
+    # subtask 2 never touched main.py - compare after round-tripping through
+    # anonymize/deanonymize once, since ast.unparse normalizes quote style
+    # (' vs ") even when nothing was actually changed.
+    from privacy.anonymizer import anonymize_workspace
+    from privacy.deanonymizer import deanonymize_code
+    anon_ws, maps = anonymize_workspace({"main.py": workspace["main.py"]}, [], [])
+    expected_unchanged = deanonymize_code(anon_ws["main.py"], maps)
+    assert result["final_workspace"]["main.py"] == expected_unchanged
     print("[PASS] Execution stopped cleanly at failure, subtask 1 preserved, subtask 2 untouched")
 
 

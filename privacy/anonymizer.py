@@ -182,3 +182,48 @@ def anonymize_code(
     }
 
     return anonymized_code, privacy_maps
+def anonymize_workspace(workspace_files, protected_identifiers=None, protected_literals=None):
+    """
+    Anonymizes MULTIPLE files using ONE SHARED CodeAnonymizer instance, so
+    the same real identifier always maps to the same placeholder across
+    files (e.g. a function defined in module_a.py and imported into
+    module_b.py gets the identical placeholder in both places), and
+    counters never collide between files.
+
+    A naive per-file anonymize_code() call for each file would create a
+    FRESH transformer with counters restarting at 0 each time - two
+    unrelated identifiers in different files could both become
+    "__ANON_FUNC_1__", and merging the resulting maps afterward would
+    silently corrupt one file's de-anonymization.
+
+    Returns (anonymized_workspace: Dict[str,str], shared_privacy_maps).
+    """
+    shared_transformer = CodeAnonymizer(
+        filepath="<workspace>",
+        protected_identifiers=protected_identifiers,
+        protected_literals=protected_literals,
+    )
+
+    anonymized_workspace = {}
+    for filepath, content in workspace_files.items():
+        try:
+            parsed_ast = ast.parse(content)
+        except SyntaxError as e:
+            return {}, {"error": f"Syntax error in '{filepath}': {str(e)}"}
+
+        # Reuse the SAME transformer instance (same identifier_map,
+        # reverse_identifier_map, and counters) across every file - this
+        # is what guarantees cross-file consistency and prevents
+        # counter collisions.
+        shared_transformer.filepath = filepath
+        transformed_ast = shared_transformer.visit(parsed_ast)
+        ast.fix_missing_locations(transformed_ast)
+        anonymized_workspace[filepath] = ast.unparse(transformed_ast)
+
+    shared_privacy_maps = {
+        "identifier_map": shared_transformer.identifier_map,
+        "reverse_identifier_map": shared_transformer.reverse_identifier_map,
+        "literal_map": shared_transformer.literal_map,
+        "reverse_literal_map": shared_transformer.reverse_literal_map,
+    }
+    return anonymized_workspace, shared_privacy_maps
