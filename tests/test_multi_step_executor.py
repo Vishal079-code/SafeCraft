@@ -61,11 +61,7 @@ def test_execute_plan_stops_at_first_failure_without_corrupting_later_files():
     # subtask 2 never touched main.py - compare after round-tripping through
     # anonymize/deanonymize once, since ast.unparse normalizes quote style
     # (' vs ") even when nothing was actually changed.
-    from privacy.anonymizer import anonymize_workspace
-    from privacy.deanonymizer import deanonymize_code
-    anon_ws, maps = anonymize_workspace({"main.py": workspace["main.py"]}, [], [])
-    expected_unchanged = deanonymize_code(anon_ws["main.py"], maps)
-    assert result["final_workspace"]["main.py"] == expected_unchanged
+    assert result["final_workspace"]["main.py"] == workspace["main.py"]
     print("[PASS] Execution stopped cleanly at failure, subtask 1 preserved, subtask 2 untouched")
 
 

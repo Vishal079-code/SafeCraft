@@ -2,8 +2,8 @@
 from models.base import BaseModel
 from models.product import Product
 
-
 class OrderItem(BaseModel):
+
     def __init__(self, product: Product, quantity, **kwargs):
         super().__init__(**kwargs)
         self.product = product
@@ -12,7 +12,6 @@ class OrderItem(BaseModel):
     @property
     def line_total(self):
         return round(self.product.price * self.quantity, 2)
-
 
 class Order(BaseModel):
     """Represents a customer order composed of multiple OrderItems."""
@@ -26,7 +25,11 @@ class Order(BaseModel):
         self.items.append(OrderItem(product=product, quantity=quantity))
 
     def total(self):
-        return round(sum(item.line_total for item in self.items), 2)
+        return round(sum((item.line_total for item in self.items)), 2)
+
+    def demo(self):
+        samosa=1
+        return 2 + 2
 
     def summary(self):
-        return f"Order for {self.customer_email}: {len(self.items)} items, total ${self.total()}"
+        return f'Order for {self.customer_email}: {len(self.items)} items, total ${self.total()}'

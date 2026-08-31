@@ -7,6 +7,14 @@ import re
 from typing import Dict, Any
 
 
+class DeanonymizationError(Exception):
+    """Raised when a placeholder-shaped token survives de-anonymization -
+    i.e. the LLM emitted something matching the __ANON_*__ pattern that
+    was never actually assigned in privacy_maps (hallucinated or mangled
+    placeholder), so it couldn't be reversed."""
+    pass
+
+
 def deanonymize_code(anonymized_text: str, privacy_maps: Dict[str, Any]) -> str:
     """
     Restores original code by substituting placeholder tokens back to their
@@ -25,7 +33,7 @@ def deanonymize_code(anonymized_text: str, privacy_maps: Dict[str, Any]) -> str:
 
     # 2. Restore literals (formatted as valid Python literal representations).
     #
-    # FIX: must use a replacement FUNCTION here, not a replacement string.
+    # Must use a replacement FUNCTION here, not a replacement string.
     # re.sub() treats backslashes in a STRING replacement specially (as
     # backreferences like \1, \g<name>). repr() of a string containing
     # backslashes (e.g. a Windows path or regex pattern) produces text
@@ -37,6 +45,18 @@ def deanonymize_code(anonymized_text: str, privacy_maps: Dict[str, Any]) -> str:
         pattern = rf"\b{re.escape(placeholder)}\b"
         formatted_val = repr(orig_val)
         result = re.sub(pattern, lambda m, v=formatted_val: v, result)
+
+    # 3. Safety net: confirm no placeholder-shaped token survived. This
+    # catches an LLM emitting a placeholder that was never actually
+    # assigned in privacy_maps (hallucinated, or a mangled copy of a real
+    # one) - previously this passed through silently, leaving a literal
+    # "__ANON_..._N__" string sitting in otherwise-normal code with no
+    # warning to the caller.
+    leftover = re.findall(r"__ANON_[A-Z]+_\d+__", result)
+    if leftover:
+        raise DeanonymizationError(
+            f"Unresolved placeholder(s) survived de-anonymization: {sorted(set(leftover))}"
+        )
 
     return result
 

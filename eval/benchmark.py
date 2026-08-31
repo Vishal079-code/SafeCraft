@@ -1,11 +1,13 @@
 """
-Day 18 Evaluation Suite: real side-by-side comparison of RAW (unanonymized)
-vs SAFECRAFT (anonymized) code generation, using the ACTUAL pipeline
-components already built and tested (anonymizer, orchestrator, diff
-parser, verifier) - not hardcoded/simulated results.
+Day 18 Evaluation Suite: real side-by-side comparison of RAW (unanonymized,
+whole-workspace, unscoped) vs SAFECRAFT (anonymized, dependency-scoped)
+code generation, using the ACTUAL pipeline components already built and
+tested (anonymizer, orchestrator, context bundler, diff parser, verifier).
+Both paths call the real, live LLM API - nothing here is hardcoded/mocked.
 """
 import json
 import time
+import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable
 
@@ -17,6 +19,7 @@ load_dotenv()
 from agent.orchestrator import AgentOrchestrator, build_system_prompt
 from agent.diff_parser import process_llm_diff_response
 from verifier.self_corrector import validate_staged_workspace
+from eval.inspect_pipeline import load_repo_as_workspace
 
 BENCHMARK_TASKS = [
     {
@@ -65,21 +68,23 @@ class BenchmarkRunner:
         self.raw_llm_caller = raw_llm_caller
         self.anon_llm_caller = anon_llm_caller
         self.results: List[Dict[str, Any]] = []
+        self.full_workspace = load_repo_as_workspace(str(self.repo_path))
 
     def _load_workspace_file(self, rel_path: str) -> str:
-        full_path = self.repo_path / rel_path
-        return full_path.read_text(encoding="utf-8")
+        return self.full_workspace[rel_path]
 
     def run_raw_baseline(self, task: Dict[str, Any]) -> Dict[str, Any]:
         start_time = time.time()
         original_code = self._load_workspace_file(task["target_file"])
 
+        file_blocks = [f"File: {path}\n```python\n{code}\n```" for path, code in self.full_workspace.items()]
+        workspace_context = "\n\n".join(file_blocks)
         prompt = (
             f"{build_system_prompt()}\n\n"
             "CRITICAL REQUIREMENT: Respond ONLY with SEARCH/REPLACE diff blocks:\n"
             "<<<<<<< SEARCH\noriginal lines\n=======\nnew lines\n>>>>>>> REPLACE\n\n"
             f"User Task: {task['description']}\n\n"
-            f"File: {task['target_file']}\n```python\n{original_code}\n```"
+            f"Primary Target File: {task['target_file']}\n\nWorkspace Files:\n{workspace_context}"
         )
         input_tokens = count_tokens(prompt)
 
@@ -103,13 +108,6 @@ class BenchmarkRunner:
         if staged is None:
             return self._failed_result("RAW", start_time, input_tokens, output_tokens, error="Patch application failed")
 
-        # FIX: use syntax_only=True instead of test_dir=None. Passing
-        # test_dir=None was never supported by validate_staged_workspace
-        # and crashed run_pytest_suite (subprocess.run's cmd list can't
-        # contain None). syntax_only=True is the real, tested way to skip
-        # Phase 2 (pytest execution) entirely - these benchmark tasks have
-        # no matching test files, so running the full suite would be both
-        # slow and irrelevant to what's being measured here.
         verification = validate_staged_workspace(
             {task["target_file"]: staged},
             modified_files=[task["target_file"]],
@@ -131,7 +129,6 @@ class BenchmarkRunner:
     def run_anonymized_safecraft(self, task: Dict[str, Any]) -> Dict[str, Any]:
         start_time = time.time()
         original_code = self._load_workspace_file(task["target_file"])
-        workspace = {task["target_file"]: original_code}
 
         orchestrator = AgentOrchestrator(
             protected_identifiers=task["protected_identifiers"],
@@ -140,19 +137,24 @@ class BenchmarkRunner:
         result = orchestrator.run_cycle(
             user_request=task["description"],
             target_filepath=task["target_file"],
-            workspace_files=workspace,
+            workspace_files=self.full_workspace,
             llm_caller_fn=self.anon_llm_caller,
         )
 
         input_tokens = count_tokens(result.anonymized_prompt) if result.anonymized_prompt else 0
 
         if not result.success:
-            return self._failed_result("SAFECRAFT_ANONYMIZED", start_time, input_tokens, error=result.error_message)
+            # bundled_files is populated by run_cycle on EVERY return path,
+            # success or failure - pass it through instead of losing it in
+            # _failed_result, so a failure still tells us what was scoped.
+            return self._failed_result(
+                "SAFECRAFT_ANONYMIZED", start_time, input_tokens,
+                error=result.error_message, bundled_files=result.bundled_files,
+            )
 
         staged = result.staged_workspace[task["target_file"]]
         output_tokens = max(count_tokens(staged) - count_tokens(original_code), 0)
 
-        # Same fix as above - syntax_only=True, not test_dir=None.
         verification = validate_staged_workspace(
             {task["target_file"]: staged},
             modified_files=[task["target_file"]],
@@ -167,6 +169,7 @@ class BenchmarkRunner:
             "ast_valid": verification["valid"],
             "expected_behavior_present": expected_present,
             "deanon_success": deanon_success,
+            "bundled_files": result.bundled_files,
             "latency_sec": round(time.time() - start_time, 2),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -184,15 +187,17 @@ class BenchmarkRunner:
         except PatchApplyError:
             return None
 
-    def _failed_result(self, mode, start_time, input_tokens, output_tokens=0, error=""):
+    def _failed_result(self, mode, start_time, input_tokens, output_tokens=0, error="", bundled_files=None):
         return {
             "mode": mode, "passed": False, "ast_valid": False, "expected_behavior_present": False,
-            "deanon_success": None, "latency_sec": round(time.time() - start_time, 2),
+            "deanon_success": None, "bundled_files": bundled_files,
+            "latency_sec": round(time.time() - start_time, 2),
             "input_tokens": input_tokens, "output_tokens": output_tokens, "error": error, "staged_code": "",
         }
 
     def execute_eval(self):
         print("Starting SafeCraft Day 18 Quality & Token Benchmark...\n")
+        print(f"Full workspace loaded: {len(self.full_workspace)} files from {self.repo_path}\n")
         for task in BENCHMARK_TASKS:
             print(f"Executing Task [{task['task_id']}]: {task['description']}")
 
@@ -212,6 +217,7 @@ class BenchmarkRunner:
                 "raw_input_tokens": raw_res["input_tokens"],
                 "anon_input_tokens": anon_res["input_tokens"],
                 "token_savings_pct": token_savings_pct,
+                "bundled_files": anon_res.get("bundled_files"),
                 "deanon_integrity": anon_res.get("deanon_success", False),
                 "raw_error": raw_res.get("error", ""),
                 "anon_error": anon_res.get("error", ""),
@@ -219,14 +225,26 @@ class BenchmarkRunner:
             self.results.append(comparison)
             print(f"  Raw Pass: {raw_res['passed']} | Anon Pass: {anon_res['passed']} | "
                   f"Tokens: {raw_res['input_tokens']} -> {anon_res['input_tokens']} "
-                  f"({token_savings_pct}% change) | Deanon OK: {comparison['deanon_integrity']}\n")
+                  f"({token_savings_pct}% change) | Bundled: {comparison['bundled_files']} | "
+                  f"Deanon OK: {comparison['deanon_integrity']}")
+            # Print errors immediately to console - don't make the JSON file
+            # the only place a failure's real cause is visible.
+            if comparison["raw_error"]:
+                print(f"    RAW error: {comparison['raw_error']}")
+            if comparison["anon_error"]:
+                print(f"    ANON error: {comparison['anon_error']}")
+            print()
 
         self.save_report()
 
     def save_report(self):
         report_dir = Path(".safecraft_data")
         report_dir.mkdir(exist_ok=True)
-        report_path = report_dir / "benchmark_results.json"
+        # Timestamped filename - previous runs' results (and their error
+        # detail) are otherwise silently overwritten by the next run, which
+        # cost us the actual error text on three separate runs in a row.
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = report_dir / f"benchmark_results_{timestamp}.json"
         report_path.write_text(json.dumps(self.results, indent=2))
         print(f"Benchmark Report Saved to: {report_path.resolve()}")
 

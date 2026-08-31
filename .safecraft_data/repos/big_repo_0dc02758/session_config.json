@@ -1,0 +1,8 @@
+{
+  "protected_identifiers": [
+    "price"
+  ],
+  "protected_literals": [
+    "samosa"
+  ]
+}
