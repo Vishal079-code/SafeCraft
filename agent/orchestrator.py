@@ -1,61 +1,39 @@
 """
-Agent Orchestrator: Multi-file pipeline connecting Context Bundling,
-(optional) Semantic Retrieval, Privacy Anonymization, LLM Prompting,
-Diff Parsing, De-anonymization, In-Memory Patch Staging, and Atomic
-Disk Commit.
+Agent Orchestrator: Multi-file pipeline connecting Context Bundling
+(V2: target-scope extraction), (optional) Semantic Retrieval, Privacy
+Anonymization, LLM Prompting, Diff Parsing, De-anonymization, Patch
+Staging, Splice-back, and Atomic Disk Commit.
 
-=== Context sourcing strategy (read this before changing run_cycle) ===
+=== V2 change: target_symbol and the splice-back requirement ===
 
-Two independent, complementary sources decide which files get sent to
-the LLM for a given task:
+When target_symbol is provided, ContextBundler sends the target file
+with ONLY that function/method's real body - everything else in the
+file is skeletonized. This means the anonymized/patched version of the
+target file that comes back from the LLM is NOT safe to write to disk
+directly - it would contain `...` in place of every OTHER function in
+that file, destroying them.
 
-1. ContextBundler (deterministic, always runs): starts from
-   target_filepath and walks its real Python import graph up to
-   max_dependency_depth hops. Cheap (no embeddings, no API calls),
-   exact, and catches "this file literally cannot be edited correctly
-   without also seeing that file" cases - e.g. a base class, a shared
-   constant, a function being called.
+So when target_symbol is set, after the normal anonymize -> LLM ->
+patch -> de-anonymize flow produces a de-anonymized version of the
+target file, splice_function_into_original() is used to extract ONLY
+the target function's new source from that result and merge it into
+the PRISTINE original file via a line-range text splice - never via
+ast.unparse() on the whole file, which would silently reformat every
+untouched function too (see bug #5 in the project README).
 
-2. HybridRetriever (semantic, OPTIONAL - only runs if a retriever is
-   passed into AgentOrchestrator): given the user's natural-language
-   task description, returns the top_k files whose CONTENT is most
-   relevant by meaning/keyword, regardless of whether they're
-   import-connected to the target at all. This catches cases
-   ContextBundler structurally cannot - e.g. "there's a similar
-   validation pattern in an unrelated file that the LLM should follow
-   for consistency," where there's no import relationship at all.
+If the splice fails for any reason (target symbol not found in either
+the original or the patched result), the run is treated as a FAILURE,
+not silently written - see the code below. A failed splice must never
+result in an accepted, partially-destructive write.
 
-The two results are UNIONED, not one replacing the other: bundled_files
-starts as ContextBundler's output, then any retriever hits not already
-present are added (skeletonized, same as dependency files - only the
-target file itself is ever sent full-source). This is deliberate:
-either source alone misses real cases the other catches.
-
-Retrieval is entirely optional and safe to omit:
-- AgentOrchestrator(retriever=None) (the default) behaves EXACTLY as
-  before retrieval existed - ContextBundler-only, no behavior change,
-  no test breakage.
-- If a retriever IS passed but its query fails for any reason (e.g. an
-  empty/not-yet-built index for this repo), that failure is caught and
-  logged, and the run proceeds with ContextBundler's results alone
-  rather than failing the whole task over an optional enhancement.
-
-Only the target file plus everything in the final unioned bundle is
-anonymized and sent to the LLM - NOT the entire workspace. Files
-outside the bundle are never anonymized, reformatted, or touched in
-any way; they pass through untouched via a plain dict copy.
-
-Multi-file anonymization uses anonymize_workspace() (a SHARED
-transformer across files), not per-file anonymize_code() calls merged
-afterward - this is what guarantees the same real identifier maps to
-the same placeholder across file boundaries, and avoids counter
-collisions.
+target_symbol=None (the default) preserves prior behavior exactly:
+whole target file sent, whole target file staged, no splicing.
 """
 import logging
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
-from agent.context_bundler import ContextBundler
+from agent.context_bundler import ContextBundler, splice_function_into_original
 from agent.skeletonizer import skeletonize_code
 from privacy.anonymizer import anonymize_workspace
 from privacy.deanonymizer import deanonymize_code
@@ -77,12 +55,6 @@ class AgentResult:
     files_written: int = 0
     attempts_used: int = 1
     bundled_files: Optional[List[str]] = None
-    # Files added specifically by semantic retrieval, i.e. present in
-    # bundled_files but NOT reachable via ContextBundler's import graph.
-    # Tracked separately so a caller/benchmark can see retrieval's actual
-    # marginal contribution, not just the final merged set. Empty list
-    # (not None) whenever a retriever was configured but contributed
-    # nothing new; None only when no retriever was configured at all.
     retrieval_added_files: Optional[List[str]] = None
 
 
@@ -109,57 +81,29 @@ class AgentOrchestrator:
         retriever=None,
         retrieval_top_k: int = 3,
     ):
-        """
-        retriever: optional object exposing .retrieve(query, top_k) ->
-            List[Dict] with each dict containing at least
-            {"metadata": {"filepath": ...}}. HybridRetriever already
-            satisfies this interface directly. None (default) disables
-            semantic retrieval entirely - ContextBundler-only behavior.
-        retrieval_top_k: how many semantic hits to request per task.
-            Only relevant when retriever is not None.
-        """
         self.protected_identifiers = protected_identifiers or []
         self.protected_literals = protected_literals or []
         self.max_dependency_depth = max_dependency_depth
         self.retriever = retriever
         self.retrieval_top_k = retrieval_top_k
 
-    def _get_retrieval_additions(
-        self, user_request: str, workspace_files: Dict[str, str], already_bundled: Dict[str, str]
-    ) -> Dict[str, str]:
-        """
-        Queries self.retriever (if configured) for files semantically
-        relevant to user_request, and returns just the NEW ones -
-        skeletonized, same treatment as ContextBundler's dependency
-        files - that aren't already in already_bundled. Returns {} if no
-        retriever is configured, the query returns nothing new, or the
-        query fails for any reason (failure is logged and swallowed,
-        never raised - retrieval is an enhancement, not a requirement).
-        """
+    def _get_retrieval_additions(self, user_request, workspace_files, already_bundled):
         additions: Dict[str, str] = {}
         if self.retriever is None:
             return additions
-
         try:
             hits = self.retriever.retrieve(user_request, top_k=self.retrieval_top_k)
         except Exception as e:
             logger.warning(f"Semantic retrieval query failed, continuing without it: {e}")
             return additions
-
         for hit in hits or []:
             meta = (hit or {}).get("metadata") or {}
             filepath = meta.get("filepath")
-            if not filepath:
-                continue
-            if filepath in already_bundled or filepath in additions:
+            if not filepath or filepath in already_bundled or filepath in additions:
                 continue
             if filepath not in workspace_files:
-                # Index may be stale relative to the current workspace
-                # (file renamed/deleted since last onboarding) - skip
-                # rather than KeyError.
                 continue
             additions[filepath] = skeletonize_code(workspace_files[filepath])
-
         return additions
 
     def run_cycle(
@@ -168,6 +112,7 @@ class AgentOrchestrator:
         target_filepath: str,
         workspace_files: Dict[str, str],
         llm_caller_fn,
+        target_symbol: Optional[str] = None,
         commit_to_disk: bool = False,
         disk_root: Optional[str] = None,
         max_attempts: int = 2,
@@ -178,12 +123,11 @@ class AgentOrchestrator:
         if target_filepath not in workspace_files:
             return AgentResult(success=False, staged_workspace=workspace_files, patches=[], anonymized_prompt="", error_message=f"Target file '{target_filepath}' not found in workspace.")
 
-        # 1. Deterministic import-graph scoping (always runs).
         bundler = ContextBundler(workspace_files, max_depth=self.max_dependency_depth)
-        bundled_files = bundler.build_bundled_context(target_filepath, skeletonize_dependencies=True)
+        bundled_files = bundler.build_bundled_context(
+            target_filepath, target_symbol=target_symbol, skeletonize_dependencies=True
+        )
 
-        # 2. Semantic scoping (only if a retriever is configured) -
-        # unioned in, never replacing what ContextBundler already found.
         retrieval_additions = self._get_retrieval_additions(user_request, workspace_files, bundled_files)
         bundled_files.update(retrieval_additions)
 
@@ -238,6 +182,22 @@ class AgentOrchestrator:
             staged_workspace = dict(workspace_files)
             for path, anon_content in staged_anonymized.items():
                 staged_workspace[path] = deanonymize_code(anon_content, privacy_maps)
+
+            # V2 splice-back: if target_symbol was used, the target
+            # file's staged content above is a partially-skeletonized
+            # view, NOT safe to write as-is. Splice just the target
+            # function into the pristine original instead.
+            if target_symbol is not None and target_filepath in staged_anonymized:
+                try:
+                    spliced = splice_function_into_original(
+                        original_content=workspace_files[target_filepath],
+                        target_symbol=target_symbol,
+                        patched_content_with_target=staged_workspace[target_filepath],
+                    )
+                    staged_workspace[target_filepath] = spliced
+                except ValueError as e:
+                    last_error = f"Splice-back failed: {str(e)}"
+                    continue  # do NOT return/write - retry or fail cleanly, never write a partial result
 
             last_patches = [
                 CodePatch(
