@@ -12,6 +12,7 @@ __pycache__/
 # Local Database & Large Data Maps
 repo_map.json
 chroma_db/
+chroma_db_bigrepo
 
 # Environment files & secret keys
 .env
