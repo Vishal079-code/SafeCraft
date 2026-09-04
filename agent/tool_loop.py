@@ -1,8 +1,35 @@
+"""
+Agent Tool-Calling Loop (Gemini): gives the LLM read_file / search_codebase
+as real tools via the google-genai SDK's function-calling interface, so it
+can request more context mid-task instead of needing every relevant file
+guessed correctly upfront.
+
+Privacy/context-minimization (V2): read_file is SYMBOL-AWARE. Calling
+read_file(filepath, symbol="function_name" or "Class.method") returns the
+file with ONLY that symbol's real body intact - every other function in
+it is skeletonized (signature + docstring only), via the same
+skeletonize_except() used by ContextBundler's target-scope extraction
+(Step 1). A symbol-less read_file(filepath) call returns the WHOLE file
+and is a deliberate, explicit fallback - the tool description below
+steers the model toward symbol-scoped reads first.
+
+Loop pattern:
+    Gemini -> (function_calls present? -> execute each -> feed results back
+               as function_response parts) -> repeat
+           -> (response.text present, no function_calls -> parse as
+               SEARCH/REPLACE diff) -> done
+
+Includes context deduplication at two levels: a (file, symbol) pair
+already sent isn't re-sent, and once a file has been sent IN FULL, any
+later read of it (symbol-scoped or not) is deduped too, since nothing
+new would be revealed.
+"""
 import json
 import logging
 from typing import Dict, Any, List, Optional, Callable
 
 from privacy.anonymizer import CodeAnonymizer
+from agent.skeletonizer import skeletonize_except
 from agent.diff_parser import process_llm_diff_response, CodePatch
 
 logger = logging.getLogger(__name__)
@@ -10,16 +37,26 @@ logger = logging.getLogger(__name__)
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
-        "description": "Read the full (anonymized) contents of a file in the workspace. Use this when you need to see a dependency's implementation, not just its signature.",
+        "description": (
+            "Read a function or method's implementation. PREFER passing "
+            "'symbol' (e.g. 'apply_discount' or 'Product.apply_discount' - "
+            "use the part of a search_codebase result's id AFTER '::') to "
+            "get just that function's real body, with the rest of the file "
+            "shown only as signatures/docstrings. Omit 'symbol' only as a "
+            "fallback when you genuinely need the whole file's content."
+        ),
         "parameters_json_schema": {
             "type": "object",
-            "properties": {"filepath": {"type": "string", "description": "Workspace-relative file path, e.g. 'auth/login.py'"}},
+            "properties": {
+                "filepath": {"type": "string", "description": "Workspace-relative file path, e.g. 'auth/login.py'"},
+                "symbol": {"type": "string", "description": "Optional. A function name or 'ClassName.method_name' to read just that symbol's real implementation."},
+            },
             "required": ["filepath"],
         },
     },
     {
         "name": "search_codebase",
-        "description": "Semantic search over the codebase for relevant functions/files given a natural language query.",
+        "description": "Semantic search over the codebase for relevant functions/files given a natural language query. Each result's id is 'filepath::symbol_name' - pass symbol_name to read_file's 'symbol' argument to fetch just that implementation.",
         "parameters_json_schema": {
             "type": "object",
             "properties": {"query": {"type": "string"}, "top_k": {"type": "integer", "default": 5}},
@@ -44,44 +81,50 @@ class AgentToolLoop:
         self.search_fn = search_fn
         self.max_rounds = max_rounds
 
-        self._files_already_sent: set = set()
-        # ONE CodeAnonymizer instance, shared across every file read_file
-        # touches during a run() call - same reasoning as
-        # anonymize_workspace()'s shared transformer (README bug #6): a
-        # fresh anonymizer per file lets the same placeholder string get
-        # assigned to two DIFFERENT real names in two different files,
-        # and merging the resulting maps afterward silently corrupts
-        # whichever file's mapping gets overwritten. Recreated fresh at
-        # the start of each run() call, not __init__, so consecutive
-        # unrelated tasks on the same AgentToolLoop instance don't leak
-        # placeholder state between them.
+        self._files_fully_sent: set = set()          # filepaths sent WITHOUT a symbol filter
+        self._symbols_sent: set = set()               # (filepath, symbol) pairs sent
+        # ONE CodeAnonymizer instance, shared across every read during a
+        # run() call - prevents the same placeholder being assigned to
+        # two different real names in two different files/reads (see
+        # README bug #6; this loop had the same latent bug until fixed).
         self._shared_transformer: Optional[CodeAnonymizer] = None
 
-    def _anonymize_and_track(self, filepath: str) -> str:
-        content = self.workspace_files.get(filepath)
-        if content is None:
+    def _anonymize_and_track(self, filepath: str, symbol: Optional[str] = None) -> str:
+        raw_content = self.workspace_files.get(filepath)
+        if raw_content is None:
             return f"[ERROR] File '{filepath}' does not exist in the workspace."
 
         import ast
+        content_to_send = raw_content if symbol is None else skeletonize_except(raw_content, symbol)
+
         try:
-            parsed = ast.parse(content)
+            parsed = ast.parse(content_to_send)
         except SyntaxError as e:
-            return f"[ERROR] Syntax error in '{filepath}': {e}"
+            return f"[ERROR] Could not process '{filepath}': {e}"
 
         self._shared_transformer.filepath = filepath
         transformed = self._shared_transformer.visit(parsed)
         ast.fix_missing_locations(transformed)
         anonymized_code = ast.unparse(transformed)
 
-        self._files_already_sent.add(filepath)
+        if symbol is None:
+            self._files_fully_sent.add(filepath)
+        else:
+            self._symbols_sent.add((filepath, symbol))
+
         return anonymized_code
 
     def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "read_file":
             filepath = tool_args.get("filepath", "")
-            if filepath in self._files_already_sent:
+            symbol = tool_args.get("symbol")  # may be None
+
+            if filepath in self._files_fully_sent:
                 return {"result": f"[Already provided earlier in this conversation - see above for '{filepath}']"}
-            anonymized = self._anonymize_and_track(filepath)
+            if symbol is not None and (filepath, symbol) in self._symbols_sent:
+                return {"result": f"[Already provided earlier in this conversation - see above for '{filepath}::{symbol}']"}
+
+            anonymized = self._anonymize_and_track(filepath, symbol=symbol)
             return {"result": anonymized}
 
         elif tool_name == "search_codebase":
@@ -96,9 +139,6 @@ class AgentToolLoop:
         return {"result": f"[Unknown tool: {tool_name}]"}
 
     def _merge_all_privacy_maps(self) -> Dict[str, Any]:
-        # No longer a per-file merge of independent maps - there's ONE
-        # shared transformer now, so this just reads its single map
-        # directly. Kept as a method for interface stability.
         if self._shared_transformer is None:
             return {"reverse_identifier_map": {}, "reverse_literal_map": {}}
         return {
@@ -106,21 +146,37 @@ class AgentToolLoop:
             "reverse_literal_map": self._shared_transformer.reverse_literal_map,
         }
 
-    def run(self, user_request: str, target_filepath: str, llm_tool_caller_fn) -> Dict[str, Any]:
-        self._files_already_sent = set()
+    def run(
+        self,
+        user_request: str,
+        target_filepath: str,
+        llm_tool_caller_fn,
+        target_symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        target_symbol (V2): if given, the INITIAL context for
+        target_filepath is also symbol-scoped (only that function's real
+        body; the rest skeletonized) - same content-minimization applied
+        to the very first thing the model sees, not just later read_file
+        calls. None (default): whole target file sent initially, matching
+        prior behavior exactly.
+        """
+        self._files_fully_sent = set()
+        self._symbols_sent = set()
         self._shared_transformer = CodeAnonymizer(
             filepath=target_filepath,
             protected_identifiers=self.protected_identifiers,
             protected_literals=self.protected_literals,
         )
 
-        initial_context = self._anonymize_and_track(target_filepath)
+        initial_context = self._anonymize_and_track(target_filepath, symbol=target_symbol)
         if initial_context.startswith("[ERROR]"):
             return {"success": False, "patches": [], "rounds_used": 0, "error_message": initial_context}
 
         system_prompt = (
             "You are an expert AI code assistant with tool access. Use read_file "
-            "to see any dependency's implementation before editing, and "
+            "(preferably WITH a symbol argument, to see just one function's real "
+            "implementation) to inspect any dependency before editing, and "
             "search_codebase to find relevant code by description. When ready, "
             "respond with your final edit using SEARCH/REPLACE block format:\n"
             "File: <filepath>\n<<<<<<< SEARCH\n<exact code>\n=======\n<new code>\n>>>>>>> REPLACE"
@@ -191,89 +247,59 @@ def run_and_commit(
     llm_tool_caller_fn,
     commit_to_disk: bool = False,
     disk_root: Optional[str] = None,
+    target_symbol: Optional[str] = None,
 ):
-    """
-    Runs the full tool-calling loop, then feeds its resulting patches
-    through the SAME staging/verification/disk-commit pipeline used by
-    AgentOrchestrator - so the agentic (multi-turn, tool-using) path and
-    the simple (single-turn) path both end up going through identical
-    safety checks (exact-match validation, AST syntax check, path
-    containment) before anything touches disk.
-
-    Returns a dict shaped consistently with AgentOrchestrator's AgentResult
-    fields, so callers don't need to branch on which path was used.
-    """
     from agent.patch_applier import apply_patches_staged, PatchApplyError
     from agent.disk_committer import commit_staged_workspace_to_disk, DiskCommitError
 
-    loop_result = loop.run(user_request, target_filepath, llm_tool_caller_fn)
+    loop_result = loop.run(user_request, target_filepath, llm_tool_caller_fn, target_symbol=target_symbol)
 
     if not loop_result["success"]:
         return {
-            "success": False,
-            "staged_workspace": loop.workspace_files,
-            "patches": loop_result["patches"],
-            "rounds_used": loop_result["rounds_used"],
-            "error_message": loop_result["error_message"],
-            "committed_to_disk": False,
-            "files_written": 0,
+            "success": False, "staged_workspace": loop.workspace_files, "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"], "error_message": loop_result["error_message"],
+            "committed_to_disk": False, "files_written": 0,
         }
 
     try:
+        # Applied directly against the REAL original files - never a
+        # separately-staged skeletonized copy - so unlike run_cycle()'s
+        # pre-bundled path, no splice-back step is needed here: patches
+        # only succeed if their (de-anonymized) SEARCH text matches real,
+        # untouched original content.
         staged_workspace = apply_patches_staged(loop.workspace_files, loop_result["patches"])
     except PatchApplyError as e:
         return {
-            "success": False,
-            "staged_workspace": loop.workspace_files,
-            "patches": loop_result["patches"],
-            "rounds_used": loop_result["rounds_used"],
-            "error_message": f"Patch Staging Failed: {e}",
-            "committed_to_disk": False,
-            "files_written": 0,
+            "success": False, "staged_workspace": loop.workspace_files, "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"], "error_message": f"Patch Staging Failed: {e}",
+            "committed_to_disk": False, "files_written": 0,
         }
 
     if not commit_to_disk:
         return {
-            "success": True,
-            "staged_workspace": staged_workspace,
-            "patches": loop_result["patches"],
-            "rounds_used": loop_result["rounds_used"],
-            "error_message": None,
-            "committed_to_disk": False,
-            "files_written": 0,
+            "success": True, "staged_workspace": staged_workspace, "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"], "error_message": None,
+            "committed_to_disk": False, "files_written": 0,
         }
 
     if not disk_root:
         return {
-            "success": False,
-            "staged_workspace": staged_workspace,
-            "patches": loop_result["patches"],
-            "rounds_used": loop_result["rounds_used"],
-            "error_message": "commit_to_disk=True but no disk_root was provided.",
-            "committed_to_disk": False,
-            "files_written": 0,
+            "success": False, "staged_workspace": staged_workspace, "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"], "error_message": "commit_to_disk=True but no disk_root was provided.",
+            "committed_to_disk": False, "files_written": 0,
         }
 
     try:
         commit_success, files_written = commit_staged_workspace_to_disk(staged_workspace, disk_root)
     except DiskCommitError as e:
         return {
-            "success": False,
-            "staged_workspace": staged_workspace,
-            "patches": loop_result["patches"],
-            "rounds_used": loop_result["rounds_used"],
-            "error_message": f"Disk Commit Blocked: {e}",
-            "committed_to_disk": False,
-            "files_written": 0,
+            "success": False, "staged_workspace": staged_workspace, "patches": loop_result["patches"],
+            "rounds_used": loop_result["rounds_used"], "error_message": f"Disk Commit Blocked: {e}",
+            "committed_to_disk": False, "files_written": 0,
         }
 
     return {
-        "success": True,
-        "staged_workspace": staged_workspace,
-        "patches": loop_result["patches"],
-        "rounds_used": loop_result["rounds_used"],
-        "error_message": None,
-        "committed_to_disk": commit_success,
-        "files_written": files_written,
+        "success": True, "staged_workspace": staged_workspace, "patches": loop_result["patches"],
+        "rounds_used": loop_result["rounds_used"], "error_message": None,
+        "committed_to_disk": commit_success, "files_written": files_written,
     }
-

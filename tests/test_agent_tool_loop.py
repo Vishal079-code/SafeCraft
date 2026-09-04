@@ -125,5 +125,61 @@ def test_shared_anonymizer_prevents_cross_file_placeholder_collision():
     placeholders_for_names = [k for k, v in reverse_map.items() if v in ("alpha_task", "beta_task")]
     assert len(set(placeholders_for_names)) == 2, "Both names collapsed onto the same placeholder!"
     print("\n[PASS] Shared transformer assigns distinct placeholders across files")
+def test_symbol_scoped_read_file_hides_other_functions():
+    """A symbol-scoped read_file call must return the target function's
+    real body, while every OTHER function in the same file is
+    skeletonized - directly verifying content minimization, not just
+    that the call succeeds."""
+    workspace = {
+        "billing.py": (
+            "def calculate_tax(amount):\n"
+            "    return amount * 0.08\n\n"
+            "def calculate_shipping_secret_formula(weight):\n"
+            "    return weight * 2.5 + 4.99\n"
+        ),
+    }
+
+    turn1_resp = MockGeminiResponse(
+        function_calls=[MockFunctionCall("read_file", {"filepath": "billing.py", "symbol": "calculate_tax"})]
+    )
+    turn2_resp = MockGeminiResponse(text="File: billing.py\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE")
+    mock_llm_caller = MagicMock(side_effect=[turn1_resp, turn2_resp])
+
+    loop = AgentToolLoop(workspace_files={"main.py": "x = 1\n", **workspace})
+    loop.run(user_request="task", target_filepath="main.py", llm_tool_caller_fn=mock_llm_caller)
+
+    read_call_result = mock_llm_caller.call_args_list[1].args[0][-1]["parts"][0]
+    tool_output = read_call_result["function_response"]["response"]["result"]
+
+    assert "amount * 0.08" in tool_output, "Requested symbol's real body should be present"
+    assert "weight * 2.5" not in tool_output, "Non-requested function's body leaked - not skeletonized!"
+    assert "..." in tool_output, "Non-requested function should show as a skeleton stub"
+    print("\n[PASS] Symbol-scoped read_file exposes only the requested function")
+
+
+def test_symbol_scoped_dedup_allows_different_symbol_same_file():
+    """Reading a DIFFERENT symbol from a file already partially read
+    should NOT be deduped - only a repeat of the SAME (file, symbol), or
+    a file already sent in full, should be."""
+    workspace = {
+        "main.py": "x = 1\n",
+        "billing.py": (
+            "def calculate_tax(amount):\n    return amount * 0.08\n\n"
+            "def calculate_shipping(weight):\n    return weight * 2.5\n"
+        ),
+    }
+    turn1 = MockGeminiResponse(function_calls=[MockFunctionCall("read_file", {"filepath": "billing.py", "symbol": "calculate_tax"})])
+    turn2 = MockGeminiResponse(function_calls=[MockFunctionCall("read_file", {"filepath": "billing.py", "symbol": "calculate_shipping"})])
+    turn3 = MockGeminiResponse(text="File: main.py\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE")
+    mock_llm_caller = MagicMock(side_effect=[turn1, turn2, turn3])
+
+    loop = AgentToolLoop(workspace_files=workspace)
+    result = loop.run(user_request="task", target_filepath="main.py", llm_tool_caller_fn=mock_llm_caller)
+
+    assert result["rounds_used"] == 3, "Second, different-symbol read should NOT have been deduped"
+    second_tool_output = mock_llm_caller.call_args_list[2].args[0][-1]["parts"][0]["function_response"]["response"]["result"]
+    assert "weight * 2.5" in second_tool_output, "The second, distinct symbol's real body should be present"
+    assert "Already provided" not in second_tool_output
+    print("\n[PASS] Different symbol from same file is not incorrectly deduped")
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
