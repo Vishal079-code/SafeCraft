@@ -83,44 +83,6 @@ def extract_argument_info(args_node: ast.arguments) -> List[Dict[str, Any]]:
     return structured_args
 
 
-def extract_function_info(node: ast.FunctionDef | ast.AsyncFunctionDef) -> Dict[str, Any]:
-    """Pull out function metadata including structured arguments and decorators."""
-    decorators = [_unparse_node(d) for d in node.decorator_list if _unparse_node(d) is not None]
-
-    return {
-        "name": node.name,
-        "args": extract_argument_info(node.args),
-        "return_annotation": _unparse_node(node.returns),
-        "docstring": ast.get_docstring(node),
-        "lineno": node.lineno,
-        "end_lineno": getattr(node, "end_lineno", node.lineno),
-        "is_async": isinstance(node, ast.AsyncFunctionDef),
-        "is_method": False,
-        "decorators": decorators,
-    }
-
-
-def extract_class_info(node: ast.ClassDef) -> Dict[str, Any]:
-    """Pull out class metadata, base classes (handling generics), and methods."""
-    methods = []
-    for item in node.body:
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            method_info = extract_function_info(item)
-            method_info["is_method"] = True
-            methods.append(method_info)
-
-    # ast.unparse cleanly captures class Foo(Generic[T], models.Base)
-    bases = [_unparse_node(base) for base in node.bases if _unparse_node(base) is not None]
-
-    return {
-        "name": node.name,
-        "docstring": ast.get_docstring(node),
-        "bases": bases,
-        "methods": methods,
-        "lineno": node.lineno,
-        "end_lineno": getattr(node, "end_lineno", node.lineno),
-    }
-
 
 def extract_imports(tree: ast.AST) -> List[Dict[str, Any]]:
     """Collect import statements including module names, aliases, and relative levels."""
@@ -149,10 +111,66 @@ def extract_imports(tree: ast.AST) -> List[Dict[str, Any]]:
     return imports
 
 
+def extract_function_info(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    source_lines: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Pull out function metadata including structured arguments and decorators.
+
+    source_lines (V2): the FULL file's source, split into lines. When
+    provided, captures the function's first ~8 real source lines as
+    source_snippet - used as embedding text for functions with NO
+    docstring, since "Function foo(a, b) in filepath" alone carries
+    almost no semantic signal for retrieval. Capped at 8 lines to keep
+    embedding text short and avoid biasing toward long functions.
+    """
+    decorators = [_unparse_node(d) for d in node.decorator_list if _unparse_node(d) is not None]
+
+    source_snippet = None
+    if source_lines:
+        start = node.lineno - 1
+        end = min(node.end_lineno, start + 8)
+        source_snippet = "\n".join(source_lines[start:end])
+
+    return {
+        "name": node.name,
+        "args": extract_argument_info(node.args),
+        "return_annotation": _unparse_node(node.returns),
+        "docstring": ast.get_docstring(node),
+        "source_snippet": source_snippet,
+        "lineno": node.lineno,
+        "end_lineno": getattr(node, "end_lineno", node.lineno),
+        "is_async": isinstance(node, ast.AsyncFunctionDef),
+        "is_method": False,
+        "decorators": decorators,
+    }
+
+
+def extract_class_info(node: ast.ClassDef, source_lines: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Pull out class metadata, base classes (handling generics), and methods."""
+    methods = []
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            method_info = extract_function_info(item, source_lines=source_lines)
+            method_info["is_method"] = True
+            methods.append(method_info)
+
+    bases = [_unparse_node(base) for base in node.bases if _unparse_node(base) is not None]
+
+    return {
+        "name": node.name,
+        "docstring": ast.get_docstring(node),
+        "bases": bases,
+        "methods": methods,
+        "lineno": node.lineno,
+        "end_lineno": getattr(node, "end_lineno", node.lineno),
+    }
+
+
 def extract_file(filepath: str | Path) -> Optional[Dict[str, Any]]:
     """Parse a single Python file into structured metadata safely."""
     filepath = Path(filepath)
-    
+
     if not filepath.exists():
         logger.error(f"File not found: {filepath}")
         return None
@@ -165,14 +183,15 @@ def extract_file(filepath: str | Path) -> Optional[Dict[str, Any]]:
         logger.warning(f"Failed to parse {filepath}: {e}")
         return None
 
+    source_lines = source.splitlines()
     functions = []
     classes = []
 
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            functions.append(extract_function_info(node))
+            functions.append(extract_function_info(node, source_lines=source_lines))
         elif isinstance(node, ast.ClassDef):
-            classes.append(extract_class_info(node))
+            classes.append(extract_class_info(node, source_lines=source_lines))
 
     return {
         "filepath": str(filepath),
@@ -181,7 +200,6 @@ def extract_file(filepath: str | Path) -> Optional[Dict[str, Any]]:
         "functions": functions,
         "classes": classes,
     }
-
 
 if __name__ == "__main__":
     import json

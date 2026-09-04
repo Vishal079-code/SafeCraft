@@ -1,11 +1,20 @@
 """
 Day 6b — Hybrid Retriever: Fuses dense vector search and sparse BM25 search
-using Reciprocal Rank Fusion (RRF).
+using Reciprocal Rank Fusion (RRF), with an OPTIONAL local reranking
+stage on top.
+
+V2 change: retrieve() now pulls a larger RRF candidate POOL than top_k
+(so there's real material for the reranker to work with), and if a
+reranker is configured, re-scores that pool against the actual query
+before truncating to top_k. If no reranker is configured (the default),
+behavior is IDENTICAL to before - a larger internal RRF pool doesn't
+change the final top_k result, since it's still just the top-ranked
+RRF items truncated to top_k.
 """
 
 import json
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from retriever.vector_store import VectorStore
 from retriever.bm25_store import BM25Index
 
@@ -13,22 +22,27 @@ logger = logging.getLogger(__name__)
 
 
 class HybridRetriever:
-    def __init__(self, vector_store: VectorStore, bm25_index: BM25Index):
+    def __init__(
+        self,
+        vector_store: VectorStore,
+        bm25_index: BM25Index,
+        reranker: Optional[Any] = None,
+        rerank_pool_size: int = 15,
+    ):
         self.vector_store = vector_store
         self.bm25_index = bm25_index
+        self.reranker = reranker
+        self.rerank_pool_size = rerank_pool_size
 
     def retrieve(self, query: str, top_k: int = 5, k_rrf: int = 60) -> List[Dict[str, Any]]:
-        """
-        Executes both Vector and BM25 queries, combining results via Reciprocal Rank Fusion (RRF).
-        RRF Score = 1 / (k_rrf + rank_vector) + 1 / (k_rrf + rank_bm25)
-        """
         if not query or not query.strip():
             return []
 
-        # Fetch extra candidates (top_k * 2) from both indexers to maximize fusion recall
-        candidate_k = max(top_k * 2, top_k)
-        
-        # Safely invoke .query or .search on vector store
+        # Pull a larger pool than top_k when a reranker is configured, so
+        # there's real material to rerank - otherwise, same sizing as
+        # before (top_k * 2), preserving exact prior behavior.
+        candidate_k = max(self.rerank_pool_size, top_k * 2) if self.reranker else max(top_k * 2, top_k)
+
         if hasattr(self.vector_store, "query"):
             vector_results = self.vector_store.query(query, top_k=candidate_k)
         elif hasattr(self.vector_store, "search"):
@@ -36,7 +50,6 @@ class HybridRetriever:
         else:
             vector_results = []
 
-        # Safely invoke .query or .search on BM25 store
         if hasattr(self.bm25_index, "query"):
             bm25_results = self.bm25_index.query(query, top_k=candidate_k)
         elif hasattr(self.bm25_index, "search"):
@@ -47,61 +60,39 @@ class HybridRetriever:
         rrf_scores: Dict[str, float] = {}
         unit_map: Dict[str, Dict[str, Any]] = {}
 
-        # Process vector ranks
         for rank, res in enumerate(vector_results, start=1):
             uid = res["id"]
-            unit_map[uid] = dict(res)  # Shallow copy to preserve isolated result metadata
+            unit_map[uid] = dict(res)
             rrf_scores[uid] = rrf_scores.get(uid, 0.0) + (1.0 / (k_rrf + rank))
 
-        # Process BM25 ranks
         for rank, res in enumerate(bm25_results, start=1):
             uid = res["id"]
             if uid not in unit_map:
                 unit_map[uid] = dict(res)
             else:
-                # Retain BM25 score metadata alongside vector score metadata
                 if "bm25_score" in res:
                     unit_map[uid]["bm25_score"] = res["bm25_score"]
-
             rrf_scores[uid] = rrf_scores.get(uid, 0.0) + (1.0 / (k_rrf + rank))
 
-        # Sort combined results by RRF score descending
         sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
 
-        final_results = []
-        for uid in sorted_ids[:top_k]:
+        pool_size = candidate_k if self.reranker else top_k
+        pool = []
+        for uid in sorted_ids[:pool_size]:
             item = unit_map[uid]
             item["rrf_score"] = float(rrf_scores[uid])
-            final_results.append(item)
+            pool.append(item)
 
-        return final_results
+        if self.reranker is not None and pool:
+            try:
+                return self.reranker.rerank(query, pool, top_k=top_k)
+            except Exception as e:
+                logger.warning(f"Reranking failed, falling back to RRF-only results: {e}")
 
-    # Interface aliases for multi-retriever benchmark support
+        return pool[:top_k]
+
     def query(self, prompt: str, top_k: int = 5) -> List[Dict[str, Any]]:
         return self.retrieve(prompt, top_k=top_k)
 
     def search(self, prompt: str, top_k: int = 5) -> List[Dict[str, Any]]:
         return self.retrieve(prompt, top_k=top_k)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    try:
-        with open("sample_repo/repo_map.json") as f:
-            repo_map = json.load(f)
-
-        v_store = VectorStore()
-        v_store.index_repo_map(repo_map)
-
-        b_index = BM25Index()
-        b_index.index_repo_map(repo_map)
-
-        retriever = HybridRetriever(vector_store=v_store, bm25_index=b_index)
-
-        print("\n=== Hybrid Query Test: 'check user password' ===")
-        hits = retriever.retrieve("check user password", top_k=3)
-        for h in hits:
-            print(f"  [RRF: {h['rrf_score']:.4f}] {h['id']}")
-            print(f"    -> {h['text']}")
-    except FileNotFoundError:
-        print("Error: sample_repo/repo_map.json not found.")

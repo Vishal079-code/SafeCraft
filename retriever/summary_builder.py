@@ -10,11 +10,17 @@ from typing import Dict, Any, List, Optional
 
 
 def build_function_summary(func: Dict[str, Any], filepath: str, class_name: Optional[str] = None) -> str:
-    """Build embeddable text for a single function/method with safe parsing."""
+    """Build embeddable text for a single function/method with safe parsing.
+
+    V2: when no docstring exists, uses the function's real source snippet
+    (first ~8 lines, captured by ast_extractor) instead of a near-empty
+    signature-only fallback. Real code carries real semantic signal even
+    without prose - this directly targets the weakest embeddings in the
+    index, which were previously just "Function foo(a, b) in filepath".
+    """
     func_name = func.get("name", "unknown_function")
     qualified_name = f"{class_name}.{func_name}" if class_name else func_name
 
-    # Safe argument extraction handling dicts, strings, or missing 'name' keys
     raw_args = func.get("args", [])
     arg_names = []
     for a in raw_args:
@@ -30,9 +36,12 @@ def build_function_summary(func: Dict[str, Any], filepath: str, class_name: Opti
     docstring = func.get("docstring")
     if docstring:
         return f"{signature}: {docstring.strip()}"
-    else:
-        return f"Function {signature} in {filepath}"
 
+    snippet = func.get("source_snippet")
+    if snippet:
+        return f"{signature}\n{snippet.strip()}"
+
+    return f"Function {signature} in {filepath}"
 
 def build_class_summary(cls: Dict[str, Any], filepath: str) -> str:
     """Build embeddable text for a class as a whole."""
