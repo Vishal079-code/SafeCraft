@@ -1,30 +1,12 @@
-"""
-Agent Tool-Calling Loop (Gemini): gives the LLM read_file / search_codebase
-as real tools via the google-genai SDK's function-calling interface, so it
-can request more context mid-task instead of needing every relevant file
-guessed correctly upfront.
-
-Loop pattern:
-    Gemini -> (function_calls present? -> execute each -> feed results back
-               as function_response parts) -> repeat
-           -> (response.text present, no function_calls -> parse as
-               SEARCH/REPLACE diff) -> done
-
-Includes context deduplication: a file already sent earlier in THIS task's
-conversation is not re-sent in full on a repeat read_file call.
-"""
 import json
 import logging
 from typing import Dict, Any, List, Optional, Callable
 
-from privacy.anonymizer import anonymize_code
+from privacy.anonymizer import CodeAnonymizer
 from agent.diff_parser import process_llm_diff_response, CodePatch
 
 logger = logging.getLogger(__name__)
 
-# Gemini FunctionDeclaration-shaped tool definitions. Wrap with
-# types.Tool(function_declarations=TOOL_DEFINITIONS) when calling the real
-# google-genai SDK - see get_gemini_tool_caller() below.
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
@@ -59,28 +41,42 @@ class AgentToolLoop:
         self.workspace_files = workspace_files
         self.protected_identifiers = protected_identifiers or []
         self.protected_literals = protected_literals or []
-        self.search_fn = search_fn  # e.g. HybridRetriever.retrieve, injected so this stays testable
+        self.search_fn = search_fn
         self.max_rounds = max_rounds
 
         self._files_already_sent: set = set()
-        self._privacy_maps_by_file: Dict[str, Dict[str, Any]] = {}
+        # ONE CodeAnonymizer instance, shared across every file read_file
+        # touches during a run() call - same reasoning as
+        # anonymize_workspace()'s shared transformer (README bug #6): a
+        # fresh anonymizer per file lets the same placeholder string get
+        # assigned to two DIFFERENT real names in two different files,
+        # and merging the resulting maps afterward silently corrupts
+        # whichever file's mapping gets overwritten. Recreated fresh at
+        # the start of each run() call, not __init__, so consecutive
+        # unrelated tasks on the same AgentToolLoop instance don't leak
+        # placeholder state between them.
+        self._shared_transformer: Optional[CodeAnonymizer] = None
 
     def _anonymize_and_track(self, filepath: str) -> str:
         content = self.workspace_files.get(filepath)
         if content is None:
             return f"[ERROR] File '{filepath}' does not exist in the workspace."
 
-        anonymized_code, privacy_maps = anonymize_code(
-            code_snippet=content, filepath=filepath,
-            protected_identifiers=self.protected_identifiers, protected_literals=self.protected_literals,
-        )
-        self._privacy_maps_by_file[filepath] = privacy_maps
+        import ast
+        try:
+            parsed = ast.parse(content)
+        except SyntaxError as e:
+            return f"[ERROR] Syntax error in '{filepath}': {e}"
+
+        self._shared_transformer.filepath = filepath
+        transformed = self._shared_transformer.visit(parsed)
+        ast.fix_missing_locations(transformed)
+        anonymized_code = ast.unparse(transformed)
+
         self._files_already_sent.add(filepath)
         return anonymized_code
 
     def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
-        """Returns a plain dict - this becomes the `response` payload of a
-        Gemini function_response part."""
         if tool_name == "read_file":
             filepath = tool_args.get("filepath", "")
             if filepath in self._files_already_sent:
@@ -100,30 +96,23 @@ class AgentToolLoop:
         return {"result": f"[Unknown tool: {tool_name}]"}
 
     def _merge_all_privacy_maps(self) -> Dict[str, Any]:
-        merged = {"reverse_identifier_map": {}, "reverse_literal_map": {}}
-        for pm in self._privacy_maps_by_file.values():
-            merged["reverse_identifier_map"].update(pm.get("reverse_identifier_map", {}))
-            merged["reverse_literal_map"].update(pm.get("reverse_literal_map", {}))
-        return merged
+        # No longer a per-file merge of independent maps - there's ONE
+        # shared transformer now, so this just reads its single map
+        # directly. Kept as a method for interface stability.
+        if self._shared_transformer is None:
+            return {"reverse_identifier_map": {}, "reverse_literal_map": {}}
+        return {
+            "reverse_identifier_map": self._shared_transformer.reverse_identifier_map,
+            "reverse_literal_map": self._shared_transformer.reverse_literal_map,
+        }
 
     def run(self, user_request: str, target_filepath: str, llm_tool_caller_fn) -> Dict[str, Any]:
-        """
-        llm_tool_caller_fn: Callable[[list, list], Any]
-            Takes (contents, tools) and returns an object shaped like the
-            real google-genai response: must expose
-              .function_calls -> list of objects with .name (str) and
-                                  .args (dict), empty list if none
-              .text -> str, the final text answer (only meaningful when
-                       function_calls is empty)
-            This indirection lets the full loop be tested without a live
-            API key - get_gemini_tool_caller() below wraps the real SDK
-            call for production use.
-
-        Returns: {"success": bool, "patches": [...], "rounds_used": int,
-                  "error_message": Optional[str]}
-        """
         self._files_already_sent = set()
-        self._privacy_maps_by_file = {}
+        self._shared_transformer = CodeAnonymizer(
+            filepath=target_filepath,
+            protected_identifiers=self.protected_identifiers,
+            protected_literals=self.protected_literals,
+        )
 
         initial_context = self._anonymize_and_track(target_filepath)
         if initial_context.startswith("[ERROR]"):
@@ -137,7 +126,6 @@ class AgentToolLoop:
             "File: <filepath>\n<<<<<<< SEARCH\n<exact code>\n=======\n<new code>\n>>>>>>> REPLACE"
         )
 
-        # Gemini's `contents` list: role is "user" or "model" (not "assistant").
         contents = [
             {"role": "user", "parts": [{"text": (
                 f"{system_prompt}\n\nUser Task: {user_request}\n\n"
@@ -175,10 +163,6 @@ class AgentToolLoop:
 
 
 def get_gemini_tool_caller(api_key: Optional[str] = None, model: str = "gemini-3.6-flash"):
-    """
-    Returns a real llm_tool_caller_fn wrapping the google-genai SDK, for
-    use with AgentToolLoop.run() outside of tests.
-    """
     import os
     from google import genai
     from google.genai import types
@@ -292,3 +276,4 @@ def run_and_commit(
         "committed_to_disk": commit_success,
         "files_written": files_written,
     }
+

@@ -86,6 +86,44 @@ def test_dedup_on_repeat_read_file(sample_workspace):
     assert "Already provided" in dedup_response, f"Dedup did not fire, got: {dedup_response!r}"
     print("\n[PASS] Deduplication correctly fired on repeat read_file")
 
+def test_shared_anonymizer_prevents_cross_file_placeholder_collision():
+    """Two files, each with a DIFFERENT protected identifier that would
+    each independently become __ANON_FUNC_1__ under a fresh-transformer-
+    per-file scheme (the bug this test guards against). With a properly
+    shared transformer, they must get DIFFERENT placeholders, and
+    de-anonymization must restore each correctly."""
+    workspace = {
+        "main.py": "def alpha_task(x):\n    return x + 1\n",
+        "utils/helpers.py": "def beta_task(y):\n    return y * 2\n",
+    }
 
+    # main.py is read first (it's the target), THEN helpers.py via read_file
+    turn1_resp = MockGeminiResponse(
+        function_calls=[MockFunctionCall("read_file", {"filepath": "utils/helpers.py"})]
+    )
+    turn2_resp = MockGeminiResponse(
+        text="File: main.py\n<<<<<<< SEARCH\nx + 1\n=======\nx + 2\n>>>>>>> REPLACE"
+    )
+    mock_llm_caller = MagicMock(side_effect=[turn1_resp, turn2_resp])
+
+    loop = AgentToolLoop(
+        workspace_files=workspace,
+        protected_identifiers=["alpha_task", "beta_task"],
+    )
+    result = loop.run(
+        user_request="task",
+        target_filepath="main.py",
+        llm_tool_caller_fn=mock_llm_caller,
+    )
+
+    assert result["success"] is True
+    reverse_map = loop._shared_transformer.reverse_identifier_map
+    # both real names must be present, mapped to DIFFERENT placeholders -
+    # this is the actual assertion that would have failed under the bug
+    assert "alpha_task" in reverse_map.values()
+    assert "beta_task" in reverse_map.values()
+    placeholders_for_names = [k for k, v in reverse_map.items() if v in ("alpha_task", "beta_task")]
+    assert len(set(placeholders_for_names)) == 2, "Both names collapsed onto the same placeholder!"
+    print("\n[PASS] Shared transformer assigns distinct placeholders across files")
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
