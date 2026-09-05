@@ -96,3 +96,18 @@ class HybridRetriever:
 
     def search(self, prompt: str, top_k: int = 5) -> List[Dict[str, Any]]:
         return self.retrieve(prompt, top_k=top_k)
+    def retrieve_metadata_only(self, query: str, top_k: int = 5, k_rrf: int = 60) -> List[Dict[str, Any]]:
+        full_results = self.retrieve(query, top_k=top_k, k_rrf=k_rrf)
+        stripped = []
+        for r in full_results:
+            meta = r.get("metadata", {})
+            stripped.append({
+                "id": r.get("id"),
+                "metadata": {
+                    "filepath": meta.get("filepath"),
+                    "name": meta.get("name"),
+                    "type": meta.get("type"),  # "function"/"class"/"method" - structural, not code
+                },
+                "score": r.get("rerank_score", r.get("rrf_score", 0.0)),
+            })
+        return stripped
