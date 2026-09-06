@@ -212,6 +212,7 @@ def run_session():
             result = orchestrator.run_cycle(
                 user_request=subtask.description,
                 target_filepath=subtask.target_filepath,
+                target_symbol=subtask.target_symbol,
                 workspace_files=workspace,
                 llm_caller_fn=llm_caller,
             )

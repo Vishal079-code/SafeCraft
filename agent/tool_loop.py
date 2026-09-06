@@ -147,76 +147,110 @@ class AgentToolLoop:
         }
 
     def run(
-        self,
-        user_request: str,
-        target_filepath: str,
-        llm_tool_caller_fn,
-        target_symbol: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        target_symbol (V2): if given, the INITIAL context for
-        target_filepath is also symbol-scoped (only that function's real
-        body; the rest skeletonized) - same content-minimization applied
-        to the very first thing the model sees, not just later read_file
-        calls. None (default): whole target file sent initially, matching
-        prior behavior exactly.
-        """
-        self._files_fully_sent = set()
-        self._symbols_sent = set()
-        self._shared_transformer = CodeAnonymizer(
-            filepath=target_filepath,
-            protected_identifiers=self.protected_identifiers,
-            protected_literals=self.protected_literals,
-        )
+            self,
+            user_request: str,
+            target_filepath: str,
+            llm_tool_caller_fn,
+            target_symbol: Optional[str] = None,
+            context_bundler=None,
+            max_dependency_depth: int = 2,
+        ) -> Dict[str, Any]:
+            """
+            context_bundler (V2): an optional ContextBundler instance (or
+            None). When provided, the INITIAL context sent to the model is
+            SEEDED from context_bundler.build_bundled_context(target_filepath,
+            target_symbol) - the target file (symbol-scoped if target_symbol
+            is given) PLUS its real import dependencies (skeletonized) - not
+            just the target file alone. Progressive tools (read_file,
+            search_codebase) remain available on top of this seed for
+            anything the bundle doesn't cover. context_bundler=None (default)
+            preserves prior behavior exactly: only the target file is sent
+            initially, and the agent must ask for everything else via tools.
 
-        initial_context = self._anonymize_and_track(target_filepath, symbol=target_symbol)
-        if initial_context.startswith("[ERROR]"):
-            return {"success": False, "patches": [], "rounds_used": 0, "error_message": initial_context}
+            Every bundled file (including dependencies) is anonymized through
+            the SAME shared CodeAnonymizer instance used for everything else
+            in this run - a protected name appearing in a dependency gets the
+            identical placeholder it would get anywhere else, and dependency
+            files are marked as "already sent" so a later read_file call for
+            one of them is correctly deduped rather than re-fetched.
+            """
+            self._files_fully_sent = set()
+            self._symbols_sent = set()
+            self._shared_transformer = CodeAnonymizer(
+                filepath=target_filepath,
+                protected_identifiers=self.protected_identifiers,
+                protected_literals=self.protected_literals,
+            )
 
-        system_prompt = (
-            "You are an expert AI code assistant with tool access. Use read_file "
-            "(preferably WITH a symbol argument, to see just one function's real "
-            "implementation) to inspect any dependency before editing, and "
-            "search_codebase to find relevant code by description. When ready, "
-            "respond with your final edit using SEARCH/REPLACE block format:\n"
-            "File: <filepath>\n<<<<<<< SEARCH\n<exact code>\n=======\n<new code>\n>>>>>>> REPLACE"
-        )
+            initial_context = self._anonymize_and_track(target_filepath, symbol=target_symbol)
+            if initial_context.startswith("[ERROR]"):
+                return {"success": False, "patches": [], "rounds_used": 0, "error_message": initial_context}
 
-        contents = [
-            {"role": "user", "parts": [{"text": (
+            seeded_dependency_blocks = []
+            if context_bundler is not None:
+                bundled = context_bundler.build_bundled_context(
+                    target_filepath, target_symbol=target_symbol, skeletonize_dependencies=True
+                )
+                for filepath, content in bundled.items():
+                    if filepath == target_filepath:
+                        continue  # already handled above, don't re-anonymize/re-add
+                    import ast
+                    try:
+                        self._shared_transformer.filepath = filepath
+                        parsed = ast.parse(content)
+                        transformed = self._shared_transformer.visit(parsed)
+                        ast.fix_missing_locations(transformed)
+                        anonymized_dep = ast.unparse(transformed)
+                    except SyntaxError:
+                        continue  # skip a dependency that fails to parse rather than aborting the whole seed
+                    self._files_fully_sent.add(filepath)  # already skeletonized/sent - dedupe future read_file calls
+                    seeded_dependency_blocks.append(f"File: {filepath} (dependency, structural only)\n```python\n{anonymized_dep}\n```")
+
+            system_prompt = (
+                "You are an expert AI code assistant with tool access. Use read_file "
+                "(preferably WITH a symbol argument, to see just one function's real "
+                "implementation) to inspect any dependency before editing, and "
+                "search_codebase to find relevant code by description. When ready, "
+                "respond with your final edit using SEARCH/REPLACE block format:\n"
+                "File: <filepath>\n<<<<<<< SEARCH\n<exact code>\n=======\n<new code>\n>>>>>>> REPLACE"
+            )
+
+            dependency_context = ("\n\n" + "\n\n".join(seeded_dependency_blocks)) if seeded_dependency_blocks else ""
+            initial_prompt_text = (
                 f"{system_prompt}\n\nUser Task: {user_request}\n\n"
                 f"File: {target_filepath}\n```python\n{initial_context}\n```"
-            )}]}
-        ]
+                f"{dependency_context}"
+            )
 
-        for round_num in range(1, self.max_rounds + 1):
-            response = llm_tool_caller_fn(contents, TOOL_DEFINITIONS)
-            function_calls = getattr(response, "function_calls", None) or []
+            contents = [{"role": "user", "parts": [{"text": initial_prompt_text}]}]
 
-            if function_calls:
-                model_parts = [{"function_call": {"name": fc.name, "args": fc.args}} for fc in function_calls]
-                contents.append({"role": "model", "parts": model_parts})
+            for round_num in range(1, self.max_rounds + 1):
+                response = llm_tool_caller_fn(contents, TOOL_DEFINITIONS)
+                function_calls = getattr(response, "function_calls", None) or []
 
-                response_parts = []
-                for fc in function_calls:
-                    tool_result = self._execute_tool(fc.name, dict(fc.args))
-                    response_parts.append({"function_response": {"name": fc.name, "response": tool_result}})
-                contents.append({"role": "user", "parts": response_parts})
-                continue
+                if function_calls:
+                    model_parts = [{"function_call": {"name": fc.name, "args": fc.args}} for fc in function_calls]
+                    contents.append({"role": "model", "parts": model_parts})
 
-            final_text = getattr(response, "text", "") or ""
-            merged_privacy_maps = self._merge_all_privacy_maps()
-            try:
-                patches = process_llm_diff_response(
-                    llm_response=final_text, privacy_maps=merged_privacy_maps, default_filepath=target_filepath,
-                )
-            except Exception as e:
-                return {"success": False, "patches": [], "rounds_used": round_num, "error_message": f"Diff parsing failed: {e}"}
+                    response_parts = []
+                    for fc in function_calls:
+                        tool_result = self._execute_tool(fc.name, dict(fc.args))
+                        response_parts.append({"function_response": {"name": fc.name, "response": tool_result}})
+                    contents.append({"role": "user", "parts": response_parts})
+                    continue
 
-            return {"success": True, "patches": patches, "rounds_used": round_num, "error_message": None}
+                final_text = getattr(response, "text", "") or ""
+                merged_privacy_maps = self._merge_all_privacy_maps()
+                try:
+                    patches = process_llm_diff_response(
+                        llm_response=final_text, privacy_maps=merged_privacy_maps, default_filepath=target_filepath,
+                    )
+                except Exception as e:
+                    return {"success": False, "patches": [], "rounds_used": round_num, "error_message": f"Diff parsing failed: {e}"}
 
-        return {"success": False, "patches": [], "rounds_used": self.max_rounds, "error_message": f"Exceeded max_rounds ({self.max_rounds}) without a final answer."}
+                return {"success": True, "patches": patches, "rounds_used": round_num, "error_message": None}
 
+            return {"success": False, "patches": [], "rounds_used": self.max_rounds, "error_message": f"Exceeded max_rounds ({self.max_rounds}) without a final answer."}
 
 def get_gemini_tool_caller(api_key: Optional[str] = None, model: str = "gemini-3.6-flash"):
     import os

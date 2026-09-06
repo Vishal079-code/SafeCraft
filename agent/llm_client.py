@@ -6,6 +6,10 @@ with fallback and error resilience.
 import os
 from typing import Optional, Callable
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 class LLMClientError(Exception):
     """Custom exception for LLM invocation failures."""

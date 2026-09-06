@@ -180,9 +180,13 @@ class AgentOrchestrator:
                 continue
 
             staged_workspace = dict(workspace_files)
-            for path, anon_content in staged_anonymized.items():
-                staged_workspace[path] = deanonymize_code(anon_content, privacy_maps)
-
+            patched_filepaths = {p.filepath for p in still_anonymized_patches}
+            for path in patched_filepaths:
+                if path in staged_anonymized:
+                    staged_workspace[path] = deanonymize_code(
+                        staged_anonymized[path],
+                        privacy_maps
+                    )
             # V2 splice-back: if target_symbol was used, the target
             # file's staged content above is a partially-skeletonized
             # view, NOT safe to write as-is. Splice just the target
@@ -223,3 +227,52 @@ class AgentOrchestrator:
 
         return AgentResult(success=False, staged_workspace=workspace_files, patches=last_patches, anonymized_prompt=full_llm_prompt,
                             error_message=f"Failed after {max_attempts} attempt(s). Last error: {last_error}", attempts_used=max_attempts, bundled_files=bundled_file_list, retrieval_added_files=retrieval_added_list)
+    def run_cycle_agentic(
+        self,
+        user_request: str,
+        target_filepath: str,
+        workspace_files: Dict[str, str],
+        llm_tool_caller_fn,
+        target_symbol: Optional[str] = None,
+        commit_to_disk: bool = False,
+        disk_root: Optional[str] = None,
+        max_rounds: int = 8,
+    ) -> AgentResult:
+            from agent.tool_loop import AgentToolLoop, run_and_commit
+            
+
+            if target_filepath not in workspace_files:
+                return AgentResult(success=False, staged_workspace=workspace_files, patches=[], anonymized_prompt="", error_message=f"Target file '{target_filepath}' not found in workspace.")
+
+            search_fn = None
+            if self.retriever is not None:
+                def search_fn(query: str, top_k: int):
+                    try:
+                        return self.retriever.retrieve(query, top_k=top_k)
+                    except Exception as e:
+                        logger.warning(f"search_codebase tool call failed: {e}")
+                        return []
+
+            bundler = ContextBundler(workspace_files, max_depth=self.max_dependency_depth)
+
+            loop = AgentToolLoop(
+                workspace_files=workspace_files,
+                protected_identifiers=self.protected_identifiers,
+                protected_literals=self.protected_literals,
+                search_fn=search_fn,
+                max_rounds=max_rounds,
+            )
+
+            result = run_and_commit(
+                loop=loop, user_request=user_request, target_filepath=target_filepath,
+                llm_tool_caller_fn=llm_tool_caller_fn, commit_to_disk=commit_to_disk,
+                disk_root=disk_root, target_symbol=target_symbol, context_bundler=bundler,
+                max_dependency_depth=self.max_dependency_depth,
+            )
+
+            return AgentResult(
+                success=result["success"], staged_workspace=result["staged_workspace"], patches=result["patches"],
+                anonymized_prompt="", error_message=result.get("error_message"),
+                committed_to_disk=result.get("committed_to_disk", False), files_written=result.get("files_written", 0),
+                attempts_used=result.get("rounds_used", 1), bundled_files=None, retrieval_added_files=None,
+            )

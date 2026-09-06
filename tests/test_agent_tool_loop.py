@@ -181,5 +181,35 @@ def test_symbol_scoped_dedup_allows_different_symbol_same_file():
     assert "weight * 2.5" in second_tool_output, "The second, distinct symbol's real body should be present"
     assert "Already provided" not in second_tool_output
     print("\n[PASS] Different symbol from same file is not incorrectly deduped")
+def test_context_bundler_seeds_initial_context_with_dependencies():
+    """With a context_bundler passed in, the agent should see its
+    dependency's real content WITHOUT calling read_file at all - and that
+    dependency must show up as already-sent (deduped) if the model tries
+    to read_file it anyway."""
+    from agent.context_bundler import ContextBundler
+
+    workspace = {
+        "main.py": "from utils import helper_secret_fn\n\ndef run():\n    return helper_secret_fn()\n",
+        "utils.py": "def helper_secret_fn():\n    return 42\n",
+    }
+    bundler = ContextBundler(workspace, max_depth=2)
+
+    # model answers immediately, no tool calls - proving the seed alone was enough
+    turn1_resp = MockGeminiResponse(text="File: main.py\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE")
+    mock_llm_caller = MagicMock(side_effect=[turn1_resp])
+
+    loop = AgentToolLoop(workspace_files=workspace, protected_identifiers=["helper_secret_fn"])
+    result = loop.run(
+        user_request="task", target_filepath="main.py",
+        llm_tool_caller_fn=mock_llm_caller, context_bundler=bundler,
+    )
+
+    assert result["success"] is True
+    assert result["rounds_used"] == 1, "Should answer immediately from seeded context, no tool round needed"
+
+    sent_prompt = mock_llm_caller.call_args_list[0].args[0][0]["parts"][0]["text"]
+    assert "utils.py" in sent_prompt, "Dependency file should be present in the seeded initial prompt"
+    assert "utils.py" in loop._files_fully_sent, "Seeded dependency must be marked as already-sent for dedup"
+    print("\n[PASS] Dependency context correctly seeded, agent answered without needing a tool round")
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

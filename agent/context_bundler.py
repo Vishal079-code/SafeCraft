@@ -22,6 +22,7 @@ import ast
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from agent.tool_loop import AgentToolLoop
 
 from agent.skeletonizer import skeletonize_code, skeletonize_except
 
@@ -249,3 +250,23 @@ class ContextBundler:
                 )
 
         return bundled
+    def run_and_commit(
+        loop: "AgentToolLoop",
+        user_request: str,
+        target_filepath: str,
+        llm_tool_caller_fn,
+        commit_to_disk: bool = False,
+        disk_root: Optional[str] = None,
+        target_symbol: Optional[str] = None,
+        context_bundler=None,
+        max_dependency_depth: int = 2,
+    ):
+        from agent.patch_applier import apply_patches_staged, PatchApplyError
+        from agent.disk_committer import commit_staged_workspace_to_disk, DiskCommitError
+
+        loop_result = loop.run(
+            user_request, target_filepath, llm_tool_caller_fn,
+            target_symbol=target_symbol, context_bundler=context_bundler,
+            max_dependency_depth=max_dependency_depth,
+        )
+        

@@ -143,14 +143,22 @@ def apply_patch_to_content(original_content: str, patch: CodePatch) -> str:
 def apply_patches_staged(file_map: Dict[str, str], patches: List[CodePatch]) -> Dict[str, str]:
     """
     Applies multiple patches across a dictionary of {filepath: file_content}.
-    Returns a copy of the updated file map if all patches apply cleanly.
+
+    Returns the complete updated file map. Callers must use the patch
+    filepaths to determine which files were actually modified.
     """
     staged_files = file_map.copy()
+
     for patch in patches:
         if patch.filepath not in staged_files:
             raise PatchApplyError(
                 f"Target file '{patch.filepath}' not found in provided workspace context."
             )
+
         current_content = staged_files[patch.filepath]
-        staged_files[patch.filepath] = apply_patch_to_content(current_content, patch)
+        staged_files[patch.filepath] = apply_patch_to_content(
+            current_content,
+            patch,
+        )
+
     return staged_files
